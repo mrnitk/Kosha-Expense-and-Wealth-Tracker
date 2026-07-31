@@ -1,9 +1,15 @@
-# Kosha — Private, Secure & Offline Expense Tracker
+# Kosha — Private, Secure & Offline Expense and Wealth Tracker
 
-Kosha is a **fully local, encrypted** personal expense tracker for Windows. You
-import your bank and credit-card statements, and Kosha turns them into a
-categorized, searchable picture of your money — **with zero network calls and no
-cloud**. Your data lives only on your machine, encrypted at rest.
+Kosha is a **fully local, encrypted** personal finance tracker for Windows. It
+does two things, both entirely offline:
+
+- **Expenses** — import your bank and credit-card statements and Kosha turns them
+  into a categorized, searchable picture of your spending.
+- **Net worth** — track assets and liabilities as dated snapshots (bank, stocks,
+  SIPs, PF, NPS, real estate, loans) and watch your wealth trend over time.
+
+Everything runs **with zero network calls and no cloud**. Your data lives only on
+your machine, encrypted at rest.
 
 Built for Indian bank statements (UPI / NEFT / IMPS / cards / SI mandates) and
 ₹ Indian number formatting, but the generic importer works with any bank.
