@@ -182,20 +182,82 @@ def test_display_label():
 
 def test_clear_transactions_keeps_rules(db):
     cat.add_rule(db, "SWIGGY", "Expense", "Food")
-    n = importer.clear_data(db, "transactions")
-    assert n == 5
+    removed = importer.clear_data(db, "transactions")
+    assert removed["transactions"] == 5
     assert db.connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
     assert db.connection.execute("SELECT count(*) FROM import_batches").fetchone()[0] == 0
     assert len(cat.list_rules(db)) == 1              # rule survives
     assert db.connection.execute("SELECT count(*) FROM accounts").fetchone()[0] == 1
 
 
-def test_clear_all_wipes_everything(db):
+def test_clear_expenses_wipes_the_expense_side_only(db):
+    from datetime import date as _date
+    from kosha import wealth
     cat.add_rule(db, "SWIGGY", "Expense", "Food")
+    aid = wealth.add_asset(db, "FD", "Bank", "Debt", "High")
+    wealth.record_snapshot(db, _date(2026, 1, 1), {aid: 500000})
+
+    importer.clear_data(db, "expenses")
+    assert db.connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+    assert len(cat.list_rules(db)) == 0
+    assert db.connection.execute("SELECT count(*) FROM accounts").fetchone()[0] == 0
+    # Net worth untouched.
+    assert len(wealth.list_assets(db)) == 1
+    assert wealth.current_networth(db).assets == 500000
+
+
+def test_clear_networth_values_keeps_the_holdings(db):
+    from datetime import date as _date
+    from kosha import wealth
+    aid = wealth.add_asset(db, "FD", "Bank", "Debt", "High")
+    lid = wealth.add_liability(db, "Car loan", "Car loan")
+    wealth.record_snapshot(db, _date(2026, 1, 1), {aid: 500000}, {lid: 300000})
+
+    removed = importer.clear_data(db, "networth_values")
+    assert removed["asset_valuations"] == 1 and removed["liability_valuations"] == 1
+    assert wealth.snapshot_dates(db) == []            # history gone
+    assert len(wealth.list_assets(db)) == 1           # holdings kept
+    assert len(wealth.list_liabilities(db)) == 1
+    # Expenses untouched.
+    assert db.connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 5
+
+
+def test_clear_networth_wipes_holdings_and_snapshots(db):
+    from datetime import date as _date
+    from kosha import wealth
+    aid = wealth.add_asset(db, "FD", "Bank", "Debt", "High")
+    wealth.record_snapshot(db, _date(2026, 1, 1), {aid: 500000})
+    wealth.add_insurance(db, "Medical", "Medical", premium_per_year=16000)
+
+    importer.clear_data(db, "networth")
+    assert wealth.list_assets(db) == [] and wealth.list_liabilities(db) == []
+    assert wealth.list_insurance(db) == [] and wealth.snapshot_dates(db) == []
+    # Expenses survive.
+    assert db.connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 5
+
+
+def test_clear_all_wipes_everything(db):
+    from datetime import date as _date
+    from kosha import wealth
+    cat.add_rule(db, "SWIGGY", "Expense", "Food")
+    aid = wealth.add_asset(db, "FD", "Bank", "Debt", "High")
+    wealth.record_snapshot(db, _date(2026, 1, 1), {aid: 500000})
+
     importer.clear_data(db, "all")
     assert db.connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
     assert len(cat.list_rules(db)) == 0
     assert db.connection.execute("SELECT count(*) FROM accounts").fetchone()[0] == 0
+    assert wealth.list_assets(db) == [] and wealth.snapshot_dates(db) == []
+
+
+def test_data_counts_reports_both_sides(db):
+    from datetime import date as _date
+    from kosha import wealth
+    aid = wealth.add_asset(db, "FD", "Bank", "Debt", "High")
+    wealth.record_snapshot(db, _date(2026, 1, 1), {aid: 500000})
+    counts = importer.data_counts(db)
+    assert counts["transactions"] == 5 and counts["assets"] == 1
+    assert counts["asset_valuations"] == 1
 
 
 def test_clear_data_rejects_unknown_scope(db):
@@ -218,7 +280,7 @@ def test_migration_adds_exclude_and_direction_columns(tmp_path):
 
     d2 = Database(db_file=db_file, salt_file=salt_file)
     d2.unlock(PW)                                     # triggers _migrate
-    assert d2.connection.execute("PRAGMA user_version").fetchone()[0] == 11
+    assert d2.connection.execute("PRAGMA user_version").fetchone()[0] == 12
     cols = {r[1] for r in d2.connection.execute("PRAGMA table_info(category_rules)")}
     assert {"excluded", "direction"} <= cols
     tcols = {r[1] for r in d2.connection.execute("PRAGMA table_info(transactions)")}

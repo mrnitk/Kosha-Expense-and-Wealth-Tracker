@@ -20,7 +20,7 @@ import sqlcipher3
 
 from . import config, crypto, features
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class WrongPasswordError(Exception):
@@ -199,6 +199,8 @@ class Database:
             # valuations, insurance, app_settings) — the CREATE TABLE IF NOT
             # EXISTS statements below add them, so no dedicated migration is
             # needed and existing expense data is untouched.
+            if current < 12:
+                self._migrate_to_v12(con)
             con.executescript(_load_schema_sql())
             if current < 3:
                 self._migrate_to_v3(con)
@@ -267,6 +269,18 @@ class Database:
         """Add ``transactions.note`` for per-transaction notes."""
         if not _has_column(con, "transactions", "note"):
             con.execute("ALTER TABLE transactions ADD COLUMN note TEXT")
+
+    @staticmethod
+    def _migrate_to_v12(con: sqlcipher3.Connection) -> None:
+        """Add ``asset_valuations.invested`` so cost basis is tracked per date.
+
+        Guarded because the table only exists from v11; a vault upgrading straight
+        from an older version gets it created by the schema instead.
+        """
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "asset_valuations" in tables and not _has_column(con, "asset_valuations", "invested"):
+            con.execute("ALTER TABLE asset_valuations ADD COLUMN invested REAL")
 
     @staticmethod
     def _migrate_to_v3(con: sqlcipher3.Connection) -> None:

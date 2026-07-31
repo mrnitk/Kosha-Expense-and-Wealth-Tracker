@@ -14,6 +14,7 @@ from __future__ import annotations
 import tempfile
 from datetime import date
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QDate, Qt, QUrl, Signal
 from PySide6.QtWidgets import (
@@ -33,6 +34,13 @@ _ASSET_HEADERS = ["Name", "Category", "Type", "Liquidity", "Owner",
 _LIAB_HEADERS = ["Name", "Kind", "Owner", "Principal", "Rate", "EMI",
                  "Outstanding", "Active"]
 _INS_HEADERS = ["Policy", "Kind", "Owner", "Premium/year", "Coverage"]
+_UPDATE_HEADERS = ["Holding", "Kind", "Category", "Type", "Liquidity", "Owner",
+                   "Active", "Previous", "Previous as of",
+                   "Invested to date", "New value"]
+# Column indices used when filling the update grid.
+_COL_PREV_AS_OF = 8
+_COL_INVESTED = 9
+_COL_NEW_VALUE = 10
 
 
 class WealthView(QWidget):
@@ -121,17 +129,26 @@ class WealthView(QWidget):
         self._as_of.setDate(QDate.currentDate())
         self._as_of.dateChanged.connect(self._load_update_grid)
         bar.addWidget(self._as_of)
-        reload_btn = QPushButton("Reload values")
-        reload_btn.setToolTip("Re-fill the grid from the last known values on or before this date")
+        reload_btn = QPushButton("Reset to last known")
+        reload_btn.setToolTip(
+            "Discard anything typed below and re-fill every row with the most recent "
+            "value recorded on or before the date above.")
         reload_btn.clicked.connect(self._load_update_grid)
         bar.addWidget(reload_btn)
+        self._estimate_btn = QPushButton("Estimate loan balances")
+        self._estimate_btn.setToolTip(
+            "Fill each loan's new value with its amortized balance on this date, "
+            "from its principal, interest rate, EMI and start date. An estimate — "
+            "overwrite it with the figure on your statement if they differ.")
+        self._estimate_btn.clicked.connect(self._on_estimate_loans)
+        bar.addWidget(self._estimate_btn)
         bar.addStretch(1)
         self._update_status = QLabel("")
         bar.addWidget(self._update_status)
         outer.addLayout(bar)
 
-        self._update_table = QTableWidget(0, 4)
-        self._update_table.setHorizontalHeaderLabels(["Holding", "Kind", "Previous", "New value"])
+        self._update_table = QTableWidget(0, len(_UPDATE_HEADERS))
+        self._update_table.setHorizontalHeaderLabels(_UPDATE_HEADERS)
         self._update_table.verticalHeader().setVisible(False)
         _fit_columns(self._update_table, stretch_col=0)
         outer.addWidget(self._update_table, stretch=1)
@@ -207,15 +224,24 @@ class WealthView(QWidget):
     def _load_assets(self) -> None:
         self._assets = wealth.list_assets(self._db)
         values, _ = wealth.latest_values(self._db)
+        invested_by_id = wealth.latest_invested(self._db)
         t = self._assets_table
         t.setRowCount(len(self._assets))
         for r, a in enumerate(self._assets):
             current = values.get(a.id, 0.0)
-            gain = current - a.invested if a.invested else 0.0
+            invested = invested_by_id.get(a.id, 0.0)
+            gain = current - invested if invested else 0.0
+            if a.is_active:
+                current_text = format_inr(current)
+                gain_text = format_inr(gain) if invested else ""
+            else:
+                # A closed holding isn't part of today's total, so don't print a
+                # live-looking figure that contradicts net worth.
+                current_text = "closed"
+                gain_text = ""
             cells = [a.name, a.category, a.asset_type, a.liquidity, a.owner,
-                     format_inr(a.invested), format_inr(current),
-                     format_inr(gain) if a.invested else "",
-                     "yes" if a.is_active else ""]
+                     format_inr(invested), current_text, gain_text,
+                     "yes" if a.is_active else "closed"]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(str(text))
                 if c in (5, 6, 7):
@@ -230,12 +256,21 @@ class WealthView(QWidget):
     def _load_liabilities(self) -> None:
         self._liabilities = wealth.list_liabilities(self._db)
         _, outstanding = wealth.latest_values(self._db)
+        today = date.today()
         t = self._liab_table
         t.setRowCount(len(self._liabilities))
         for r, l in enumerate(self._liabilities):
+            if l.id in outstanding:
+                owed = format_inr(outstanding[l.id])
+            else:
+                # Nothing recorded yet — show the amortized estimate (clearly marked)
+                # rather than a bare 0.00, which reads as "nothing owed".
+                estimate = wealth.estimate_outstanding_for(self._db, l.id, today)
+                owed = f"≈ {format_inr(estimate)} (est.)" if estimate is not None \
+                    else "not recorded"
             cells = [l.name, l.kind, l.owner, format_inr(l.principal),
                      f"{l.interest_rate:.2f}%" if l.interest_rate else "",
-                     format_inr(l.emi_amount), format_inr(outstanding.get(l.id, 0.0)),
+                     format_inr(l.emi_amount), owed,
                      "yes" if l.is_active else ""]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(str(text))
@@ -292,6 +327,15 @@ class WealthView(QWidget):
         dlg.exec()
         if dlg.saved:
             self.refresh(); self.changed.emit()
+            if getattr(dlg, "retired_now", False):
+                QMessageBox.information(
+                    self, "Holding closed",
+                    f"“{asset.name}” is closed from {date.today().isoformat()} and its "
+                    "value is now 0, so net worth has dropped by that amount.\n\n"
+                    "Add the money to wherever it went (bank, another fund) on the "
+                    "Update values tab. Its history stays intact and the row moves to "
+                    "the bottom of the list.")
+
 
     def _on_delete_asset(self) -> None:
         aid = self._selected_id(self._assets_table)
@@ -312,6 +356,19 @@ class WealthView(QWidget):
         dlg.exec()
         if dlg.saved:
             self.refresh(); self.changed.emit()
+            self._report_recorded_outstanding(dlg)
+
+    def _report_recorded_outstanding(self, dlg) -> None:
+        """Tell the user what balance was computed and recorded on save."""
+        value = getattr(dlg, "recorded_outstanding", None)
+        if value is None:
+            return
+        QMessageBox.information(
+            self, "Outstanding recorded",
+            f"Worked out today's balance as ₹{format_inr(value)} from the principal, "
+            "interest rate, EMI and start date, and recorded it for "
+            f"{date.today().isoformat()}.\n\n"
+            "If your statement says otherwise, correct it on the Update values tab.")
 
     def _on_edit_liability(self, *_a) -> None:
         lid = self._selected_id(self._liab_table)
@@ -322,6 +379,7 @@ class WealthView(QWidget):
         dlg.exec()
         if dlg.saved:
             self.refresh(); self.changed.emit()
+            self._report_recorded_outstanding(dlg)
 
     def _on_delete_liability(self) -> None:
         lid = self._selected_id(self._liab_table)
@@ -354,25 +412,49 @@ class WealthView(QWidget):
         return date(d.year(), d.month(), d.day())
 
     def _load_update_grid(self) -> None:
-        """Fill the grid with each holding and its last known value."""
+        """Fill the grid with each holding, its attributes and last known value."""
         as_of = self._current_as_of()
         assets = wealth.list_assets(self._db, active_only=True)
         liabs = wealth.list_liabilities(self._db, active_only=True)
         prev_assets, prev_liabs = wealth.latest_values(self._db, as_of)
+        prev_invested = wealth.latest_invested(self._db, as_of)
+        prev_dates = self._previous_value_dates(as_of)
 
         t = self._update_table
         t.setRowCount(len(assets) + len(liabs))
         self._update_rows: list[tuple[str, int]] = []
         row = 0
         for a in assets:
-            self._add_update_row(row, a.name, "Asset", prev_assets.get(a.id, 0.0))
+            self._add_update_row(
+                row, a.name, "Asset",
+                [a.category, a.asset_type, a.liquidity, a.owner,
+                 "yes" if a.is_active else ""],
+                prev_assets.get(a.id, 0.0), prev_dates[0].get(a.id, ""),
+                invested=prev_invested.get(a.id, 0.0))
             self._update_rows.append(("asset", a.id))
             row += 1
         for l in liabs:
-            self._add_update_row(row, l.name, "Liability", prev_liabs.get(l.id, 0.0))
+            self._add_update_row(
+                row, l.name, "Liability",
+                [l.kind, "", "", l.owner, "yes" if l.is_active else ""],
+                prev_liabs.get(l.id, 0.0), prev_dates[1].get(l.id, ""),
+                invested=None)          # invested is meaningless for a loan
             self._update_rows.append(("liability", l.id))
             row += 1
+        self._estimate_btn.setEnabled(bool(liabs))
         _autosize(t)
+
+    def _previous_value_dates(self, as_of):
+        """{asset_id: date} / {liability_id: date} the carried-forward value came from."""
+        cutoff = as_of.isoformat()
+        con = self._db.connection
+        assets = dict(con.execute(
+            "SELECT asset_id, MAX(as_of) FROM asset_valuations WHERE as_of<=? "
+            "GROUP BY asset_id", (cutoff,)).fetchall())
+        liabs = dict(con.execute(
+            "SELECT liability_id, MAX(as_of) FROM liability_valuations WHERE as_of<=? "
+            "GROUP BY liability_id", (cutoff,)).fetchall())
+        return assets, liabs
 
         existing = wealth.snapshot_dates(self._db)
         iso = as_of.isoformat()
@@ -385,26 +467,54 @@ class WealthView(QWidget):
         else:
             self._update_status.setText("No snapshots yet — this will be the first.")
 
-    def _add_update_row(self, row: int, name: str, kind: str, previous: float) -> None:
+    def _add_update_row(self, row: int, name: str, kind: str, attributes: list[str],
+                        previous: float, previous_as_of: str,
+                        invested: Optional[float]) -> None:
+        """A read-only holding row plus editable 'Invested to date' / 'New value'."""
         t = self._update_table
-        name_item = QTableWidgetItem(name)
-        name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        t.setItem(row, 0, name_item)
-        kind_item = QTableWidgetItem(kind)
-        kind_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        kind_item.setTextAlignment(Qt.AlignCenter)
-        t.setItem(row, 1, kind_item)
-        prev_item = QTableWidgetItem(format_inr(previous))
-        prev_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        prev_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        t.setItem(row, 2, prev_item)
+        cells = [name, kind, *attributes, format_inr(previous),
+                 previous_as_of or "never recorded"]
+        for col, text in enumerate(cells):
+            item = QTableWidgetItem(str(text))
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)   # read-only
+            if col in (1, 6, _COL_PREV_AS_OF):
+                item.setTextAlignment(Qt.AlignCenter)
+            elif col == 7:
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            t.setItem(row, col, item)
 
-        spin = QDoubleSpinBox()
-        spin.setRange(0.0, 10_000_000_000.0)
-        spin.setDecimals(2)
-        spin.setGroupSeparatorShown(True)
-        spin.setValue(previous or 0.0)
-        t.setCellWidget(row, 3, spin)
+        if invested is None:
+            # Liabilities have no cost basis — leave the cell blank and unusable.
+            blank = QTableWidgetItem("—")
+            blank.setFlags(Qt.ItemIsEnabled)
+            blank.setTextAlignment(Qt.AlignCenter)
+            t.setItem(row, _COL_INVESTED, blank)
+        else:
+            t.setCellWidget(row, _COL_INVESTED, _amount_spin(invested))
+        t.setCellWidget(row, _COL_NEW_VALUE, _amount_spin(previous))
+
+    def _on_estimate_loans(self) -> None:
+        """Fill each loan's new value with its amortized balance on this date."""
+        as_of = self._current_as_of()
+        filled, skipped = 0, []
+        for row, (kind, holding_id) in enumerate(getattr(self, "_update_rows", [])):
+            if kind != "liability":
+                continue
+            estimate = wealth.estimate_outstanding_for(self._db, holding_id, as_of)
+            spin = self._update_table.cellWidget(row, _COL_NEW_VALUE)
+            if estimate is None or spin is None:
+                name_item = self._update_table.item(row, 0)
+                skipped.append(name_item.text() if name_item else "a loan")
+                continue
+            spin.setValue(estimate)
+            filled += 1
+        message = (f"Estimated {filled} loan balance(s) as of {as_of.isoformat()}.\n\n"
+                   "These are amortization estimates — check them against your "
+                   "statement and edit any that differ, then Save snapshot.")
+        if skipped:
+            message += ("\n\nCouldn't estimate: " + ", ".join(skipped) +
+                        "\n(needs principal, EMI and a start date)")
+        QMessageBox.information(self, "Loan balances estimated", message)
 
     def _on_save_snapshot(self) -> None:
         if not getattr(self, "_update_rows", None):
@@ -413,15 +523,20 @@ class WealthView(QWidget):
             return
         asset_values: dict[int, float] = {}
         liab_values: dict[int, float] = {}
+        invested_values: dict[int, float] = {}
         for row, (kind, holding_id) in enumerate(self._update_rows):
-            spin = self._update_table.cellWidget(row, 3)
+            spin = self._update_table.cellWidget(row, _COL_NEW_VALUE)
             if spin is None:
                 continue
             if kind == "asset":
                 asset_values[holding_id] = spin.value()
+                invested_spin = self._update_table.cellWidget(row, _COL_INVESTED)
+                if invested_spin is not None:
+                    invested_values[holding_id] = invested_spin.value()
             else:
                 liab_values[holding_id] = spin.value()
-        wealth.record_snapshot(self._db, self._current_as_of(), asset_values, liab_values)
+        wealth.record_snapshot(self._db, self._current_as_of(), asset_values,
+                               liab_values, invested_values)
         self.refresh()
         self.changed.emit()
         point = wealth.current_networth(self._db)
@@ -484,14 +599,20 @@ class WealthView(QWidget):
 
     def _load_matrix(self) -> None:
         dates, rows = wealth.snapshot_matrix(self._db)
+        attrs = wealth.MATRIX_ATTRIBUTES
+        first_date_col = 1 + len(attrs)
         t = self._matrix
         t.clear()
-        t.setColumnCount(1 + len(dates))
-        t.setHorizontalHeaderLabels(["Holding"] + dates)
+        t.setColumnCount(first_date_col + len(dates))
+        t.setHorizontalHeaderLabels(["Holding"] + attrs + dates)
         t.setRowCount(len(rows))
-        for r, (name, values) in enumerate(rows):
+        for r, (name, attributes, values) in enumerate(rows):
             t.setItem(r, 0, QTableWidgetItem(name))
-            for c, value in enumerate(values, start=1):
+            for c, text in enumerate(attributes, start=1):
+                item = QTableWidgetItem(str(text))
+                item.setTextAlignment(Qt.AlignCenter)
+                t.setItem(r, c, item)
+            for c, value in enumerate(values, start=first_date_col):
                 item = QTableWidgetItem("" if value is None else format_inr(value))
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(r, c, item)
@@ -511,6 +632,9 @@ class WealthView(QWidget):
             rows = wealth.allocation(self._db, dimension)
             if rows:
                 figs.append(charts.category_pie(rows, title))
+        gain_rows = [r for r in wealth.gain_series(self._db) if r[1]]
+        if gain_rows:
+            figs.append(charts.gain_over_time(gain_rows))
         gains = wealth.invested_vs_current(self._db)
         gains = [g for g in gains if g[1]]          # only holdings with a cost basis
         if gains:
@@ -529,6 +653,16 @@ class WealthView(QWidget):
 
 
 # --- small helpers -----------------------------------------------------------
+
+def _amount_spin(value: float) -> QDoubleSpinBox:
+    """A rupee spin box for the editable cells in the update grid."""
+    spin = QDoubleSpinBox()
+    spin.setRange(0.0, 10_000_000_000.0)
+    spin.setDecimals(2)
+    spin.setGroupSeparatorShown(True)
+    spin.setValue(value or 0.0)
+    return spin
+
 
 def _table(headers: list[str], stretch_col: int = 0) -> QTableWidget:
     t = QTableWidget(0, len(headers))

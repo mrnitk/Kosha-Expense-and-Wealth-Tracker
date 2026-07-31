@@ -226,7 +226,11 @@ def test_main_window_has_rules_tab(tmp_path):
     db = _make_db(tmp_path)
     win = MainWindow(db)
     titles = [win._tabs.tabText(i) for i in range(win._tabs.count())]
-    assert titles == ["Dashboard", "Categorize", "Rules", "Recurring", "Net worth"]
+    assert titles == ["Expenses", "Net worth"]          # two top-level sections
+    sub = [win._expense_tabs.tabText(i) for i in range(win._expense_tabs.count())]
+    assert sub == ["Dashboard", "Categorize", "Rules", "Recurring"]
+    nw = [win._wealth._tabs.tabText(i) for i in range(win._wealth._tabs.count())]
+    assert nw == ["Holdings", "Update values", "Net worth"]
     win.close()
 
 
@@ -305,14 +309,14 @@ def test_dashboard_lazy_refresh(tmp_path):
 def test_categorize_marks_dashboard_dirty_not_rebuilt(tmp_path):
     db = _make_db(tmp_path)
     win = MainWindow(db)
-    win._tabs.setCurrentWidget(win._view)   # leave the dashboard tab
-    win._dashboard.refresh()                # start clean
+    win._expense_tabs.setCurrentWidget(win._view)   # leave the dashboard sub-tab
+    win._dashboard.refresh()                        # start clean
     assert win._dashboard._dirty is False
     # Assigning on the Categorize tab should only flag the dashboard, not rebuild.
     win._view.assign("SWIGGY LIMITED", "Expense", "Food")
     assert win._dashboard._dirty is True
-    # Returning to the dashboard tab clears it (rebuilds once).
-    win._tabs.setCurrentWidget(win._dashboard)
+    # Returning to the dashboard sub-tab clears it (rebuilds once).
+    win._expense_tabs.setCurrentWidget(win._dashboard)
     assert win._dashboard._dirty is False
     win.close()
 
@@ -321,7 +325,11 @@ def test_main_window_has_recurring_tab_and_backup(tmp_path):
     db = _make_db(tmp_path)
     win = MainWindow(db)
     titles = [win._tabs.tabText(i) for i in range(win._tabs.count())]
-    assert titles == ["Dashboard", "Categorize", "Rules", "Recurring", "Net worth"]
+    assert titles == ["Expenses", "Net worth"]          # two top-level sections
+    sub = [win._expense_tabs.tabText(i) for i in range(win._expense_tabs.count())]
+    assert sub == ["Dashboard", "Categorize", "Rules", "Recurring"]
+    nw = [win._wealth._tabs.tabText(i) for i in range(win._wealth._tabs.count())]
+    assert nw == ["Holdings", "Update values", "Net worth"]
     file_menu = next(m for m in win.menuBar().findChildren(type(win.menuBar().addMenu("x")))
                      if "File" in m.title())
     labels = [a.text() for a in file_menu.actions()]
@@ -369,6 +377,254 @@ def test_dashboard_has_search_box(tmp_path):
     db.lock()
 
 
+def test_asset_dialog_save_creates_asset(tmp_path):
+    """Regression: Save did nothing because add_asset() rejected is_active."""
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import AssetDialog
+    db = _make_db(tmp_path)
+    dlg = AssetDialog(db)
+    dlg._name.setText("HDFC-Cash")
+    dlg._category.setCurrentText("Bank")
+    dlg._asset_type.setCurrentText("Cash")
+    dlg._liquidity.setCurrentText("High")
+    dlg._owner.setCurrentText("Mom")
+    dlg._invested.setValue(1000)
+    dlg._on_save()
+    assert dlg.saved is True
+    assets = wealth.list_assets(db)
+    assert len(assets) == 1
+    a = assets[0]
+    assert (a.name, a.owner, a.invested, a.is_active) == ("HDFC-Cash", "Mom", 1000, True)
+    db.lock()
+
+
+def test_asset_dialog_can_create_inactive(tmp_path):
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import AssetDialog
+    db = _make_db(tmp_path)
+    dlg = AssetDialog(db)
+    dlg._name.setText("Closed FD")
+    dlg._active.setChecked(False)
+    dlg._on_save()
+    assert wealth.list_assets(db)[0].is_active is False
+    db.lock()
+
+
+def test_asset_dialog_edits_existing(tmp_path):
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import AssetDialog
+    db = _make_db(tmp_path)
+    aid = wealth.add_asset(db, "Old", "Bank", "Cash", "High")
+    asset = wealth.list_assets(db)[0]
+    dlg = AssetDialog(db, asset)
+    dlg._name.setText("Renamed")
+    dlg._on_save()
+    assets = wealth.list_assets(db)
+    assert len(assets) == 1 and assets[0].name == "Renamed" and assets[0].id == aid
+    db.lock()
+
+
+def test_asset_dialog_requires_name(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import AssetDialog
+    db = _make_db(tmp_path)
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: QMessageBox.Ok))
+    dlg = AssetDialog(db)
+    dlg._on_save()                      # no name entered
+    assert dlg.saved is False and wealth.list_assets(db) == []
+    db.lock()
+
+
+def test_liability_dialog_save_creates_liability(tmp_path):
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import LiabilityDialog
+    db = _make_db(tmp_path)
+    dlg = LiabilityDialog(db)
+    dlg._name.setText("Car loan - HDFC")
+    dlg._kind.setCurrentText("Car loan")
+    dlg._principal.setValue(800000)
+    dlg._emi.setValue(16000)
+    dlg._rate.setValue(9.5)
+    dlg._on_save()
+    assert dlg.saved is True
+    liabs = wealth.list_liabilities(db)
+    assert len(liabs) == 1
+    assert (liabs[0].name, liabs[0].emi_amount, liabs[0].is_active) == \
+           ("Car loan - HDFC", 16000, True)
+    assert wealth.monthly_obligations(db) == 16000
+    db.lock()
+
+
+def test_liability_dialog_inactive_is_not_counted(tmp_path):
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import LiabilityDialog
+    db = _make_db(tmp_path)
+    dlg = LiabilityDialog(db)
+    dlg._name.setText("Paid-off loan")
+    dlg._emi.setValue(5000)
+    dlg._active.setChecked(False)
+    dlg._on_save()
+    assert wealth.list_liabilities(db)[0].is_active is False
+    assert wealth.monthly_obligations(db) == 0        # closed loans don't count
+    db.lock()
+
+
+def test_liability_dialog_warns_when_emi_cannot_repay(tmp_path, monkeypatch):
+    """The user's 10L @ 8% with a 3,000 EMI can never amortize — warn before saving."""
+    from PySide6.QtWidgets import QMessageBox
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import LiabilityDialog
+    db = _make_db(tmp_path)
+    seen = {}
+
+    def _capture(parent, title, text, *a, **k):
+        seen["title"], seen["text"] = title, text
+        return QMessageBox.Cancel                 # user backs out
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(_capture))
+
+    dlg = LiabilityDialog(db)
+    dlg._name.setText("Car")
+    dlg._principal.setValue(1000000)
+    dlg._rate.setValue(8.0)
+    dlg._emi.setValue(3000)
+    dlg._on_save()
+    assert dlg.saved is False and wealth.list_liabilities(db) == []   # not saved
+    assert "repay" in seen["title"].lower()
+    assert "doesn't cover the monthly interest" in seen["text"]
+
+    # Saying yes saves it anyway (the user may know better than the model).
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+    dlg._on_save()
+    assert dlg.saved is True and len(wealth.list_liabilities(db)) == 1
+    db.lock()
+
+
+def test_liability_dialog_saves_quietly_with_sane_emi(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import LiabilityDialog
+    db = _make_db(tmp_path)
+    called = []
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: called.append(1) or QMessageBox.Yes))
+    dlg = LiabilityDialog(db)
+    dlg._name.setText("Car loan")
+    dlg._principal.setValue(1000000)
+    dlg._rate.setValue(8.0)
+    dlg._emi.setValue(19000)                      # comfortably above interest
+    dlg._on_save()
+    assert dlg.saved is True and not called       # no warning shown
+    assert len(wealth.list_liabilities(db)) == 1
+    db.lock()
+
+
+def test_liability_dialog_records_outstanding_on_save(tmp_path):
+    """Saving a loan with full terms computes and stores today's outstanding."""
+    from PySide6.QtCore import QDate
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import LiabilityDialog
+    db = _make_db(tmp_path)
+    dlg = LiabilityDialog(db)
+    dlg._name.setText("Car")
+    dlg._principal.setValue(1000000)
+    dlg._rate.setValue(8.0)
+    dlg._emi.setValue(50000)
+    dlg._start.setDate(QDate(2026, 1, 1))
+    assert dlg._record_estimate.isChecked()          # on by default
+    dlg._on_save()
+    assert dlg.saved and dlg.recorded_outstanding is not None
+    # It's a real snapshot, so net worth already reflects the debt.
+    point = wealth.current_networth(db)
+    assert point.liabilities == dlg.recorded_outstanding
+    db.lock()
+
+
+def test_liability_dialog_can_skip_auto_outstanding(tmp_path):
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import LiabilityDialog
+    db = _make_db(tmp_path)
+    dlg = LiabilityDialog(db)
+    dlg._name.setText("Car")
+    dlg._principal.setValue(1000000)
+    dlg._rate.setValue(8.0)
+    dlg._emi.setValue(50000)
+    dlg._record_estimate.setChecked(False)
+    dlg._on_save()
+    assert dlg.saved and dlg.recorded_outstanding is None
+    assert wealth.snapshot_dates(db) == []           # nothing recorded
+    db.lock()
+
+
+def test_holdings_shows_estimate_when_no_snapshot(tmp_path):
+    """A loan with no recorded outstanding shows an estimate, not a bare 0.00."""
+    from datetime import date
+    from kosha import wealth
+    from kosha.ui.wealth_view import WealthView
+    db = _make_db(tmp_path)
+    wealth.add_liability(db, "Car loan", "Car loan", principal=800000,
+                         interest_rate=9.5, emi_amount=16800,
+                         start_date=date(2026, 7, 1))
+    view = WealthView(db)
+    shown = view._liab_table.item(0, 6).text()
+    assert "est." in shown and "0.00" != shown
+    db.lock()
+
+
+def test_holdings_marks_closed_assets(tmp_path):
+    """A closed holding must not show a live-looking current value."""
+    from datetime import date
+    from kosha import wealth
+    from kosha.ui.wealth_view import WealthView
+    db = _make_db(tmp_path)
+    fd = wealth.add_asset(db, "FD", "Bank", "Debt", "High")
+    wealth.record_snapshot(db, date(2026, 1, 1), {fd: 500000})
+    wealth.update_asset(db, fd, is_active=False)
+    view = WealthView(db)
+    assert view._assets_table.item(0, 6).text() == "closed"   # current value column
+    assert view._assets_table.item(0, 8).text() == "closed"   # active column
+    db.lock()
+
+
+def test_insurance_dialog_save(tmp_path):
+    from kosha import wealth
+    from kosha.ui.wealth_dialogs import InsuranceDialog
+    db = _make_db(tmp_path)
+    dlg = InsuranceDialog(db)
+    dlg._name.setText("Medical - Self")
+    dlg._premium.setValue(16000)
+    dlg._coverage.setValue(2000000)
+    dlg._on_save()
+    assert dlg.saved is True
+    assert wealth.insurance_summary(db) == (16000, 2000000)
+    db.lock()
+
+
+def test_owner_combo_offers_me_mom_wife(tmp_path):
+    from kosha.ui.wealth_dialogs import AssetDialog
+    db = _make_db(tmp_path)
+    dlg = AssetDialog(db)
+    owners = [dlg._owner.itemText(i) for i in range(dlg._owner.count())]
+    assert owners[:3] == ["Me", "Mom", "Wife"]
+    db.lock()
+
+
+def test_wealth_view_add_asset_appears_in_table(tmp_path):
+    """End-to-end: the Holdings table shows an asset saved from the dialog."""
+    from kosha import wealth
+    from kosha.ui.wealth_view import WealthView
+    db = _make_db(tmp_path)
+    view = WealthView(db)
+    assert view._assets_table.rowCount() == 0
+    wealth.add_asset(db, "SBI-FD/RD", "Bank", "Debt", "High", owner="Wife")
+    view.refresh()
+    assert view._assets_table.rowCount() == 1
+    assert view._assets_table.item(0, 0).text() == "SBI-FD/RD"
+    assert view._assets_table.item(0, 4).text() == "Wife"
+    db.lock()
+
+
 def test_main_window_has_template_actions(tmp_path):
     db = _make_db(tmp_path)
     win = MainWindow(db)
@@ -378,6 +634,30 @@ def test_main_window_has_template_actions(tmp_path):
     assert any("Import from" in t and "template" in t.lower() for t in labels)
     assert any("Download" in t and "template" in t.lower() for t in labels)
     win.close()
+
+
+def test_clear_data_dialog_offers_networth_scopes(tmp_path):
+    from datetime import date
+    from kosha import wealth
+    from kosha.ui.clear_data_dialog import ClearDataDialog, describe
+    db = _make_db(tmp_path)
+    aid = wealth.add_asset(db, "FD", "Bank", "Debt", "High")
+    wealth.record_snapshot(db, date(2026, 1, 1), {aid: 500000})
+
+    dlg = ClearDataDialog(db)
+    scopes = [scope for scope, _radio in dlg._buttons]
+    assert scopes == ["transactions", "expenses", "networth_values", "networth", "all"]
+    assert dlg.selected_scope() == "transactions"          # safest default
+
+    # Choosing a net-worth scope clears only that side.
+    next(r for s, r in dlg._buttons if s == "networth").setChecked(True)
+    assert dlg.selected_scope() == "networth"
+    from kosha import importer
+    removed = importer.clear_data(db, dlg.selected_scope())
+    assert wealth.list_assets(db) == []
+    assert db.connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 4
+    assert "assets" in describe(removed)
+    db.lock()
 
 
 def test_main_window_has_clear_action(tmp_path):

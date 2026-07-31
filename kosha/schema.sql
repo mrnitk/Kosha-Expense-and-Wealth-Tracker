@@ -77,11 +77,16 @@ CREATE TABLE IF NOT EXISTS assets (
     notes                  TEXT
 );
 
+-- ``value`` is what the holding was worth on that date; ``invested`` is how much
+-- had been put in by then. Both move for SIPs and stocks (you keep investing and
+-- the market moves), so both are dated — a single cost basis would make gains
+-- wrong for every past date. NULL invested falls back to assets.invested.
 CREATE TABLE IF NOT EXISTS asset_valuations (
     id       INTEGER PRIMARY KEY,
     asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
     as_of    DATE NOT NULL,
     value    REAL NOT NULL,
+    invested REAL,
     UNIQUE(asset_id, as_of)                        -- one value per asset per date
 );
 

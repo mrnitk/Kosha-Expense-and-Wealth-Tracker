@@ -81,7 +81,7 @@ def test_migration_rederives_keywords(tmp_path):
     d2.unlock(PW)                                     # triggers re-derive
     kw = d2.connection.execute("SELECT merchant_keyword FROM transactions WHERE id=1").fetchone()[0]
     assert kw == "BBPY CC PAYMENT"
-    assert d2.connection.execute("PRAGMA user_version").fetchone()[0] == 11
+    assert d2.connection.execute("PRAGMA user_version").fetchone()[0] == 12
     d2.lock()
 
 

@@ -27,6 +27,7 @@ from . import tabular, wealth
 from .db import Database
 
 ASSET_SHEET = "Assets"
+INVESTED_SHEET = "Invested"
 LIABILITY_SHEET = "Liabilities"
 INSURANCE_SHEET = "Insurance"
 
@@ -232,21 +233,26 @@ def _read_sheet(path, sheet: str, fields: dict[str, str], require_dates: bool = 
 def read_wealth_template(path):
     """Read the whole workbook.
 
-    Returns ``(assets, asset_values, liabilities, liability_values, insurance,
-    problems)``. Raises :class:`WealthTemplateError` if no usable sheet is found.
+    Returns ``(assets, asset_values, invested_values, liabilities,
+    liability_values, insurance, problems)``. Raises
+    :class:`WealthTemplateError` if no usable sheet is found.
     """
     assets, asset_values, problems = _read_sheet(path, ASSET_SHEET, _ASSET_FIELDS)
+    # Optional: how much had been put into each holding by each date. For SIPs and
+    # stocks the cost basis rises over time, so it's dated like the value.
+    _inv_rows, invested_values, inv_problems = _read_sheet(
+        path, INVESTED_SHEET, _ASSET_FIELDS)
     liabs, liab_values, liab_problems = _read_sheet(path, LIABILITY_SHEET, _LIABILITY_FIELDS)
     insurance, _iv, ins_problems = _read_sheet(
         path, INSURANCE_SHEET, _INSURANCE_FIELDS, require_dates=False)
-    problems = problems + liab_problems + ins_problems
+    problems = problems + inv_problems + liab_problems + ins_problems
     if not assets and not liabs:
         raise WealthTemplateError(
             "No net-worth data found. The workbook needs an 'Assets' (or "
             "'Liabilities') sheet with a Name column and at least one date "
             "column such as Jun'26 — download the template from "
             "File ▸ Download net-worth template.")
-    return assets, asset_values, liabs, liab_values, insurance, problems
+    return assets, asset_values, invested_values, liabs, liab_values, insurance, problems
 
 
 # --- importing ---------------------------------------------------------------
@@ -262,6 +268,7 @@ class WealthImportResult:
         self.insurance_created = 0
         self.snapshots: list[str] = []
         self.values_recorded = 0
+        self.invested_recorded = 0
         self.problems: list[str] = []
 
     @property
@@ -278,6 +285,9 @@ class WealthImportResult:
             lines.append(f"Insurance: {self.insurance_created} added.")
         lines.append(f"Recorded {self.values_recorded} value(s) across "
                      f"{len(self.snapshots)} snapshot date(s).")
+        if self.invested_recorded:
+            lines.append(f"Also recorded {self.invested_recorded} invested-to-date "
+                         "figure(s) from the Invested sheet.")
         if self.snapshots:
             shown = ", ".join(self.snapshots[:8])
             more = f" … (+{len(self.snapshots) - 8})" if len(self.snapshots) > 8 else ""
@@ -293,7 +303,7 @@ class WealthImportResult:
 
 def import_wealth_template(db: Database, path) -> WealthImportResult:
     """Create/update holdings from the workbook and record every snapshot column."""
-    (assets, asset_values, liabs, liab_values,
+    (assets, asset_values, invested_values, liabs, liab_values,
      insurance, problems) = read_wealth_template(path)
     result = WealthImportResult()
     result.problems = list(problems)
@@ -353,25 +363,36 @@ def import_wealth_template(db: Database, path) -> WealthImportResult:
         result.insurance_created += 1
 
     # Group every value by date so each date is written as one snapshot.
-    by_date: dict[date, tuple[dict[int, float], dict[int, float]]] = {}
+    by_date: dict[date, tuple[dict[int, float], dict[int, float], dict[int, float]]] = {}
+
+    def _slot(as_of):
+        return by_date.setdefault(as_of, ({}, {}, {}))
+
     for name, per_date in asset_values.items():
         holding_id = asset_ids.get(name)
         if holding_id is None:
             continue
         for as_of, value in per_date.items():
-            by_date.setdefault(as_of, ({}, {}))[0][holding_id] = value
+            _slot(as_of)[0][holding_id] = value
     for name, per_date in liab_values.items():
         holding_id = liab_ids.get(name)
         if holding_id is None:
             continue
         for as_of, value in per_date.items():
-            by_date.setdefault(as_of, ({}, {}))[1][holding_id] = value
+            _slot(as_of)[1][holding_id] = value
+    for name, per_date in invested_values.items():
+        holding_id = asset_ids.get(name)
+        if holding_id is None:
+            continue                      # an Invested row with no matching asset
+        for as_of, value in per_date.items():
+            _slot(as_of)[2][holding_id] = value
 
     for as_of in sorted(by_date):
-        asset_map, liab_map = by_date[as_of]
-        wealth.record_snapshot(db, as_of, asset_map, liab_map)
+        asset_map, liab_map, invested_map = by_date[as_of]
+        wealth.record_snapshot(db, as_of, asset_map, liab_map, invested_map)
         result.snapshots.append(as_of.isoformat())
         result.values_recorded += len(asset_map) + len(liab_map)
+        result.invested_recorded += len(invested_map)
     return result
 
 
@@ -392,11 +413,16 @@ def write_wealth_template(path, db: Optional[Database] = None) -> None:
 
     dates = wealth.snapshot_dates(db) if db else []
     date_headers = [d[:7] for d in dates]        # 'YYYY-MM' reads well as a column
+    if not date_headers:
+        # A blank template has no history, so seed example date columns —
+        # otherwise there's nothing on screen to show that dates go here.
+        date_headers = _example_date_headers()
 
     ws = wb.active
     ws.title = ASSET_SHEET
+    _add_banner(ws, len(ASSET_HEADERS), date_headers)
     ws.append(ASSET_HEADERS + date_headers)
-    for cell in ws[1]:
+    for cell in ws[ws.max_row]:
         cell.font = bold
     if db:
         for asset in wealth.list_assets(db):
@@ -409,11 +435,32 @@ def write_wealth_template(path, db: Optional[Database] = None) -> None:
         ws.append(["HDFC-Cash", "Bank", "Cash", "High", "Me", 0])
         ws.append(["Mine (Non Tax saving)", "Mutual funds", "Equity", "Medium", "Me", 600000])
     _widths(ws, [30, 16, 12, 12, 10, 14] + [14] * len(date_headers), get_column_letter)
-    ws.freeze_panes = "B2"
+    ws.freeze_panes = "B3"       # keep the banner + header rows and Name visible
+
+    # Optional sheet: how much had been put in by each date. For SIPs and stocks
+    # the cost basis keeps rising, so gains need it dated like the value.
+    iv = wb.create_sheet(INVESTED_SHEET)
+    _add_banner(iv, len(ASSET_HEADERS), date_headers, what="AMOUNT INVESTED SO FAR")
+    iv.append(ASSET_HEADERS + date_headers)
+    for cell in iv[iv.max_row]:
+        cell.font = bold
+    if db:
+        for asset in wealth.list_assets(db):
+            recorded = dict(db.connection.execute(
+                "SELECT as_of, invested FROM asset_valuations "
+                "WHERE asset_id=? AND invested IS NOT NULL", (asset.id,)).fetchall())
+            if recorded:
+                iv.append([asset.name, asset.category, asset.asset_type, asset.liquidity,
+                           asset.owner, asset.invested] + [recorded.get(d) for d in dates])
+    else:
+        iv.append(["Mine (Non Tax saving)", "Mutual funds", "Equity", "Medium", "Me", 0])
+    _widths(iv, [30, 16, 12, 12, 10, 14] + [14] * len(date_headers), get_column_letter)
+    iv.freeze_panes = "B3"
 
     lw = wb.create_sheet(LIABILITY_SHEET)
+    _add_banner(lw, len(LIABILITY_HEADERS), date_headers, outstanding=True)
     lw.append(LIABILITY_HEADERS + date_headers)
-    for cell in lw[1]:
+    for cell in lw[lw.max_row]:
         cell.font = bold
     if db:
         for liab in wealth.list_liabilities(db):
@@ -447,6 +494,9 @@ def write_wealth_template(path, db: Optional[Database] = None) -> None:
         ["One row per holding. Attribute columns first, then ONE COLUMN PER DATE."],
         [""],
         ["Assets sheet", "Name, Category, Type, Liquidity, Owner, Invested, then date columns"],
+        ["Invested sheet", "OPTIONAL. Same layout — how much you had put in by each date."],
+        ["", "Use it for SIPs and stocks, where the amount invested keeps rising:"],
+        ["", "gains = value on that date − invested by that date."],
         ["Liabilities sheet", "Name, Kind, Owner, Principal, Interest rate, EMI, Start, End, then dates"],
         ["Insurance sheet", "Name, Kind, Owner, Premium per year, Coverage (never counted in net worth)"],
         [""],
@@ -454,7 +504,7 @@ def write_wealth_template(path, db: Optional[Database] = None) -> None:
         ["", "Month-only headers are stored as the 1st of that month."],
         ["Values", "The amount held (assets) or still owed (liabilities) on that date."],
         ["", "Leave a cell blank if you didn't record that holding on that date."],
-        ["Type", "Cash / Debt / Equity / Hybrid"],
+        ["Type", "Cash / Debt / Equity / Hybrid / Real estate"],
         ["Liquidity", "High / Medium / Low / Lowest"],
         ["Kind (liabilities)", "Home loan / Car loan / Personal loan / Credit card / Other"],
         [""],
@@ -466,6 +516,41 @@ def write_wealth_template(path, db: Optional[Database] = None) -> None:
     _widths(info, [26, 74], get_column_letter)
 
     wb.save(str(path))
+
+
+def _add_banner(ws, attribute_count: int, date_headers: list[str],
+                outstanding: bool = False, what: Optional[str] = None) -> None:
+    """Write a hint row above the headers marking where the date columns begin.
+
+    Without it a blank template gives no clue that the columns after the fixed
+    attributes are snapshot dates. The importer finds the real header row by
+    content, so this extra row is ignored on import.
+    """
+    from openpyxl.styles import Font
+    if what is None:
+        what = "AMOUNT STILL OWED" if outstanding else "VALUE HELD"
+    row = [""] * attribute_count
+    row[0] = "↓ describe each holding ↓"
+    if date_headers:
+        row.append(f"↓ ONE COLUMN PER DATE — enter the {what} on that date "
+                   f"(add or rename columns: Jun'26, 2026-06, June 2026 …) ↓")
+    ws.append(row)
+    for cell in ws[ws.max_row]:
+        cell.font = Font(italic=True, size=9, color="FF7F6000")
+
+
+def _example_date_headers(count: int = 3) -> list[str]:
+    """A few recent month headers (oldest first) to demonstrate date columns."""
+    today = date.today()
+    months = []
+    year, month = today.year, today.month
+    for _ in range(count):
+        months.append(f"{year:04d}-{month:02d}")
+        month -= 6                                # roughly half-yearly snapshots
+        while month <= 0:
+            month += 12
+            year -= 1
+    return list(reversed(months))
 
 
 def _widths(ws, widths, get_column_letter) -> None:

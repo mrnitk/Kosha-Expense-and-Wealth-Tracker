@@ -12,11 +12,12 @@ from typing import Optional
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QLineEdit, QMessageBox, QPlainTextEdit,
+    QFormLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
 )
 
 from .. import wealth
 from ..db import Database
+from ..format import format_inr
 
 _MAX_AMOUNT = 10_000_000_000.0      # ₹1,000 crore — generous upper bound
 
@@ -31,11 +32,18 @@ def _amount_box(value: float = 0.0) -> QDoubleSpinBox:
 
 
 def _owner_combo(db: Database, current: str = "Me") -> QComboBox:
-    """Owner picker that is editable, seeded with owners already in use."""
+    """Owner picker: the common owners first, then any others already in use.
+
+    Editable, so a name that isn't listed can simply be typed.
+    """
     combo = QComboBox()
     combo.setEditable(True)
-    owners = {a.owner for a in wealth.list_assets(db)} | {l.owner for l in wealth.list_liabilities(db)}
-    for owner in sorted(owners | {"Me"}):
+    in_use = ({a.owner for a in wealth.list_assets(db)}
+              | {l.owner for l in wealth.list_liabilities(db)}
+              | {p.owner for p in wealth.list_insurance(db)})
+    for owner in wealth.OWNERS:
+        combo.addItem(owner)
+    for owner in sorted(o for o in in_use if o and o not in wealth.OWNERS):
         combo.addItem(owner)
     combo.setCurrentText(current or "Me")
     return combo
@@ -49,6 +57,7 @@ class AssetDialog(QDialog):
         self._db = db
         self._asset = asset
         self.saved = False
+        self.retired_now = False        # True when this save closed the holding
         self.setWindowTitle("Edit asset" if asset else "Add asset")
         self.setMinimumWidth(420)
         self._build()
@@ -105,6 +114,7 @@ class AssetDialog(QDialog):
         if not name:
             QMessageBox.warning(self, "Name required", "Give this asset a name.")
             return
+        active = self._active.isChecked()
         fields = dict(
             name=name,
             category=self._category.currentText().strip() or "Other",
@@ -113,11 +123,17 @@ class AssetDialog(QDialog):
             owner=self._owner.currentText().strip() or "Me",
             invested=self._invested.value(),
             counts_toward_networth=self._counts.isChecked(),
-            is_active=self._active.isChecked(),
+            is_active=active,
             notes=self._notes.toPlainText().strip() or None,
         )
+        self.retired_now = False
         if self._asset:
             wealth.update_asset(self._db, self._asset.id, **fields)
+            # Closing it: date the closure with a 0 so net worth drops from today
+            # rather than the old value lingering.
+            if self._asset.is_active and not active:
+                wealth.retire_asset(self._db, self._asset.id)
+                self.retired_now = True
         else:
             wealth.add_asset(self._db, **fields)
         self.saved = True
@@ -132,6 +148,8 @@ class LiabilityDialog(QDialog):
         self._db = db
         self._liability = liability
         self.saved = False
+        self.recorded_outstanding = None      # set when the balance is auto-recorded
+        self.retired_now = False              # True when this save closed the loan
         self.setWindowTitle("Edit liability" if liability else "Add liability")
         self.setMinimumWidth(420)
         self._build()
@@ -180,6 +198,14 @@ class LiabilityDialog(QDialog):
         self._active.setChecked(l.is_active if l else True)
         form.addRow("", self._active)
 
+        self._record_estimate = QCheckBox("Work out today's outstanding from these figures")
+        self._record_estimate.setToolTip(
+            "On save, compute the amortized balance for today from the principal, "
+            "interest rate, EMI and start date, and record it as today's value. "
+            "Uncheck to enter the outstanding yourself on the Update values tab.")
+        self._record_estimate.setChecked(True)
+        form.addRow("", self._record_estimate)
+
         self._notes = QPlainTextEdit(l.notes or "" if l else "")
         self._notes.setFixedHeight(56)
         form.addRow("Notes:", self._notes)
@@ -194,6 +220,8 @@ class LiabilityDialog(QDialog):
         if not name:
             QMessageBox.warning(self, "Name required", "Give this liability a name.")
             return
+        if not self._check_emi_repays():
+            return
         fields = dict(
             name=name,
             kind=self._kind.currentText().strip() or "Other",
@@ -205,16 +233,49 @@ class LiabilityDialog(QDialog):
             end_date=self._end.date().toString("yyyy-MM-dd"),
             notes=self._notes.toPlainText().strip() or None,
         )
+        active = self._active.isChecked()
+        self.retired_now = False
         if self._liability:
-            wealth.update_liability(self._db, self._liability.id,
-                                    is_active=self._active.isChecked(), **fields)
+            liability_id = self._liability.id
+            wealth.update_liability(self._db, liability_id, is_active=active, **fields)
+            if self._liability.is_active and not active:
+                wealth.retire_liability(self._db, liability_id)   # paid off: 0 owed
+                self.retired_now = True
         else:
-            wealth.add_liability(self._db, **fields)
-            if not self._active.isChecked():
-                newest = wealth.list_liabilities(self._db)[-1]
-                wealth.update_liability(self._db, newest.id, is_active=False)
+            liability_id = wealth.add_liability(self._db, is_active=active, **fields)
+
+        self.recorded_outstanding = None
+        if self._record_estimate.isChecked() and not self.retired_now:
+            self.recorded_outstanding = wealth.record_estimated_outstanding(
+                self._db, liability_id)
         self.saved = True
         self.accept()
+
+    def _check_emi_repays(self) -> bool:
+        """Warn if the EMI can never clear the loan. Returns False to stop saving."""
+        principal = self._principal.value()
+        rate = self._rate.value()
+        emi = self._emi.value()
+        shortfall = wealth.emi_shortfall(principal, rate, emi)
+        if shortfall is None:
+            return True
+        interest = wealth.monthly_interest(principal, rate)
+        months = wealth.months_between(
+            self._start.date().toString("yyyy-MM-dd"),
+            self._end.date().toString("yyyy-MM-dd"))
+        needed = wealth.required_emi(principal, rate, months) if months else None
+        detail = (
+            f"An EMI of ₹{format_inr(emi)} doesn't cover the monthly interest of "
+            f"₹{format_inr(interest)} on ₹{format_inr(principal)} at {rate:.2f}%.\n\n"
+            f"The balance would grow by about ₹{format_inr(shortfall)} every month "
+            "instead of reducing, so this loan can never be repaid.")
+        if needed:
+            detail += (f"\n\nTo clear it over {months} months you'd need an EMI of "
+                       f"about ₹{format_inr(needed)}.")
+        detail += "\n\nSave these figures anyway?"
+        return QMessageBox.warning(
+            self, "EMI won't repay this loan", detail,
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) == QMessageBox.Yes
 
 
 class InsuranceDialog(QDialog):

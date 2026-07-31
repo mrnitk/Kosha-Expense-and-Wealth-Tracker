@@ -21,7 +21,9 @@ from typing import Optional
 from .db import Database
 
 CATEGORIES = ("Bank", "Stocks", "Mutual funds", "PF", "NPS", "Other")
-ASSET_TYPES = ("Cash", "Debt", "Equity", "Hybrid")
+#: Suggested owners for holdings — the pickers are editable, so others can be typed.
+OWNERS = ("Me", "Mom", "Wife")
+ASSET_TYPES = ("Cash", "Debt", "Equity", "Hybrid", "Real estate")
 LIQUIDITY = ("High", "Medium", "Low", "Lowest")
 LIABILITY_KINDS = ("Home loan", "Car loan", "Personal loan", "Credit card", "Other")
 INSURANCE_KINDS = ("Life", "Medical", "Term", "Other")
@@ -107,6 +109,7 @@ def add_asset(
     counts_toward_networth: bool = True,
     notes: Optional[str] = None,
     sort_order: int = 0,
+    is_active: bool = True,
 ) -> int:
     """Create an asset (a place money sits). Returns its id."""
     if not name.strip():
@@ -114,9 +117,10 @@ def add_asset(
     con = db.connection
     cur = con.execute(
         "INSERT INTO assets(name, category, asset_type, liquidity, owner, invested, "
-        "counts_toward_networth, is_active, sort_order, notes) VALUES (?,?,?,?,?,?,?,1,?,?)",
+        "counts_toward_networth, is_active, sort_order, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (name.strip(), category, asset_type, liquidity, owner.strip() or "Me",
-         invested or 0.0, 1 if counts_toward_networth else 0, sort_order, notes),
+         invested or 0.0, 1 if counts_toward_networth else 0,
+         1 if is_active else 0, sort_order, notes),
     )
     con.commit()
     return cur.lastrowid
@@ -155,7 +159,8 @@ def list_assets(db: Database, active_only: bool = False) -> list[Asset]:
            "counts_toward_networth, is_active, sort_order, notes FROM assets")
     if active_only:
         sql += " WHERE is_active=1"
-    sql += " ORDER BY sort_order, category, name"
+    # Closed holdings sink to the bottom of every list, still visible for history.
+    sql += " ORDER BY is_active DESC, sort_order, category, name"
     return [
         Asset(i, n, c, t, l, o, inv or 0.0, bool(cnt), bool(act), so, note)
         for i, n, c, t, l, o, inv, cnt, act, so, note in db.connection.execute(sql).fetchall()
@@ -176,6 +181,7 @@ def add_liability(
     end_date=None,
     notes: Optional[str] = None,
     sort_order: int = 0,
+    is_active: bool = True,
 ) -> int:
     """Create a liability (loan / EMI / card outstanding). Returns its id."""
     if not name.strip():
@@ -183,10 +189,11 @@ def add_liability(
     con = db.connection
     cur = con.execute(
         "INSERT INTO liabilities(name, kind, owner, principal, interest_rate, emi_amount, "
-        "start_date, end_date, is_active, sort_order, notes) VALUES (?,?,?,?,?,?,?,?,1,?,?)",
+        "start_date, end_date, is_active, sort_order, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (name.strip(), kind, owner.strip() or "Me", principal or 0.0, interest_rate,
          emi_amount or 0.0, _as_iso(start_date) if start_date else None,
-         _as_iso(end_date) if end_date else None, sort_order, notes),
+         _as_iso(end_date) if end_date else None,
+         1 if is_active else 0, sort_order, notes),
     )
     con.commit()
     return cur.lastrowid
@@ -225,7 +232,7 @@ def list_liabilities(db: Database, active_only: bool = False) -> list[Liability]
            "start_date, end_date, is_active, sort_order, notes FROM liabilities")
     if active_only:
         sql += " WHERE is_active=1"
-    sql += " ORDER BY sort_order, kind, name"
+    sql += " ORDER BY is_active DESC, sort_order, kind, name"
     return [
         Liability(i, n, k, o, p or 0.0, rate, emi or 0.0, sd, ed, bool(act), so, note)
         for i, n, k, o, p, rate, emi, sd, ed, act, so, note in db.connection.execute(sql).fetchall()
@@ -239,20 +246,38 @@ def record_snapshot(
     as_of,
     asset_values: Optional[dict[int, float]] = None,
     liability_values: Optional[dict[int, float]] = None,
+    invested_values: Optional[dict[int, float]] = None,
 ) -> None:
     """Record values for ``as_of``, replacing any existing values on that date.
 
     Pass only the holdings you want to set; others keep whatever they had. This
     is the "update" action — one call per portfolio review.
+
+    ``invested_values`` records how much had been put into each asset by that
+    date — for a SIP or a stock position that number keeps rising, so it's dated
+    alongside the market value rather than held as one static figure.
     """
     iso = _as_iso(as_of)
+    invested_values = invested_values or {}
     con = db.connection
     try:
         for asset_id, value in (asset_values or {}).items():
+            invested = invested_values.get(asset_id)
             con.execute(
-                "INSERT INTO asset_valuations(asset_id, as_of, value) VALUES (?,?,?) "
-                "ON CONFLICT(asset_id, as_of) DO UPDATE SET value=excluded.value",
-                (asset_id, iso, float(value)),
+                "INSERT INTO asset_valuations(asset_id, as_of, value, invested) VALUES (?,?,?,?) "
+                "ON CONFLICT(asset_id, as_of) DO UPDATE SET value=excluded.value, "
+                "invested=COALESCE(excluded.invested, asset_valuations.invested)",
+                (asset_id, iso, float(value),
+                 float(invested) if invested is not None else None),
+            )
+        # Invested can also be recorded on its own (e.g. imported separately).
+        for asset_id, invested in invested_values.items():
+            if asset_values and asset_id in asset_values:
+                continue
+            con.execute(
+                "INSERT INTO asset_valuations(asset_id, as_of, value, invested) VALUES (?,?,0,?) "
+                "ON CONFLICT(asset_id, as_of) DO UPDATE SET invested=excluded.invested",
+                (asset_id, iso, float(invested)),
             )
         for liability_id, outstanding in (liability_values or {}).items():
             con.execute(
@@ -328,6 +353,56 @@ def _countable_asset_ids(db: Database) -> set[int]:
         "SELECT id FROM assets WHERE counts_toward_networth=1").fetchall()}
 
 
+def _active_ids(db: Database) -> tuple[set[int], set[int]]:
+    """(active asset ids, active liability ids)."""
+    con = db.connection
+    return (
+        {r[0] for r in con.execute("SELECT id FROM assets WHERE is_active=1").fetchall()},
+        {r[0] for r in con.execute("SELECT id FROM liabilities WHERE is_active=1").fetchall()},
+    )
+
+
+def explicit_values(db: Database, as_of) -> tuple[dict[int, float], dict[int, float]]:
+    """Values recorded *on exactly* ``as_of`` (no carry-forward)."""
+    iso = _as_iso(as_of)
+    con = db.connection
+    return (
+        dict(con.execute(
+            "SELECT asset_id, value FROM asset_valuations WHERE as_of=?", (iso,)).fetchall()),
+        dict(con.execute(
+            "SELECT liability_id, outstanding FROM liability_valuations WHERE as_of=?",
+            (iso,)).fetchall()),
+    )
+
+
+def values_on(db: Database, as_of=None) -> tuple[dict[int, float], dict[int, float]]:
+    """The values that count on a date — every holding carries its last value forward.
+
+    Retirement needs no special case here. Closing a holding (see
+    :func:`retire_asset`) records a **0** on the closing date, and that 0 simply
+    carries forward like any other value: the holding counts fully before that
+    date and contributes nothing after it. Unticking "Active" without a date
+    would be a guess, so Kosha dates the closure instead of inferring it.
+    """
+    return latest_values(db, as_of)
+
+
+def retire_asset(db: Database, asset_id: int, as_of=None) -> None:
+    """Mark an asset closed and record a 0 for it on ``as_of`` (default today).
+
+    The 0 is what makes net worth drop from that date — you then enter the money
+    wherever it actually went (bank, another fund) in the usual update.
+    """
+    record_snapshot(db, as_of or date.today(), {asset_id: 0.0})
+    update_asset(db, asset_id, is_active=False)
+
+
+def retire_liability(db: Database, liability_id: int, as_of=None) -> None:
+    """Mark a loan closed/paid off and record 0 outstanding on ``as_of``."""
+    record_snapshot(db, as_of or date.today(), liability_values={liability_id: 0.0})
+    update_liability(db, liability_id, is_active=False)
+
+
 def networth_series(db: Database, carry_forward: bool = True) -> list[NetWorthPoint]:
     """Totals per snapshot date, with growth % against the previous snapshot.
 
@@ -341,14 +416,9 @@ def networth_series(db: Database, carry_forward: bool = True) -> list[NetWorthPo
     prev_net: Optional[float] = None
     for iso in snapshot_dates(db):
         if carry_forward:
-            asset_vals, liab_vals = latest_values(db, iso)
+            asset_vals, liab_vals = values_on(db, iso)
         else:
-            con = db.connection
-            asset_vals = dict(con.execute(
-                "SELECT asset_id, value FROM asset_valuations WHERE as_of=?", (iso,)).fetchall())
-            liab_vals = dict(con.execute(
-                "SELECT liability_id, outstanding FROM liability_valuations WHERE as_of=?",
-                (iso,)).fetchall())
+            asset_vals, liab_vals = explicit_values(db, iso)
         assets_total = sum(v for aid, v in asset_vals.items() if aid in countable)
         liabs_total = sum(liab_vals.values())
         net = assets_total - liabs_total
@@ -384,7 +454,7 @@ def allocation(db: Database, by: str = "liquidity", as_of=None) -> list[tuple[st
     column = _ALLOCATION_COLUMNS.get(by)
     if column is None:
         raise ValueError(f"unknown allocation dimension {by!r}")
-    asset_vals, _ = latest_values(db, as_of)
+    asset_vals, _ = values_on(db, as_of)     # retired holdings don't carry forward
     buckets: dict[str, float] = {}
     rows = db.connection.execute(
         f"SELECT id, {column} FROM assets WHERE counts_toward_networth=1").fetchall()
@@ -398,16 +468,154 @@ def allocation(db: Database, by: str = "liquidity", as_of=None) -> list[tuple[st
     return out
 
 
+_LATEST_INVESTED_SQL = """
+    SELECT v.asset_id, v.invested
+    FROM asset_valuations v
+    WHERE v.as_of <= ? AND v.invested IS NOT NULL
+      AND v.as_of = (SELECT MAX(x.as_of) FROM asset_valuations x
+                     WHERE x.asset_id = v.asset_id AND x.as_of <= ?
+                       AND x.invested IS NOT NULL)
+"""
+
+
+def latest_invested(db: Database, as_of=None) -> dict[int, float]:
+    """Most recent recorded *invested* per asset, on or before ``as_of``.
+
+    Falls back to the asset's static ``invested`` for holdings that have never had
+    it snapshotted, so a one-off purchase still shows a cost basis.
+    """
+    cutoff = _as_iso(as_of) if as_of is not None else _MAX_DATE
+    dated = dict(db.connection.execute(_LATEST_INVESTED_SQL, (cutoff, cutoff)).fetchall())
+    out = {a.id: a.invested for a in list_assets(db) if a.invested}
+    out.update(dated)                     # a dated figure always wins
+    return out
+
+
 def invested_vs_current(db: Database, as_of=None) -> list[tuple[str, float, float, float]]:
-    """Rows (asset name, invested, current, gain) for assets with a cost basis."""
+    """Rows (asset name, invested, current, gain) using the cost basis on that date."""
     asset_vals, _ = latest_values(db, as_of)
+    invested_by_id = latest_invested(db, as_of)
     out = []
     for asset in list_assets(db):
         current = asset_vals.get(asset.id, 0.0)
-        if asset.invested or current:
-            out.append((asset.name, asset.invested, current, current - asset.invested))
+        invested = invested_by_id.get(asset.id, 0.0)
+        if invested or current:
+            out.append((asset.name, invested, current, current - invested))
     out.sort(key=lambda r: r[2], reverse=True)
     return out
+
+
+def gain_series(db: Database) -> list[tuple[str, float, float, float]]:
+    """Rows (date, invested, current value, gain) across every snapshot.
+
+    Both figures move over time — you keep investing *and* the market moves — so
+    this shows contributions and growth side by side rather than conflating them.
+    Only assets that count toward net worth are included.
+    """
+    countable = _countable_asset_ids(db)
+    out = []
+    for iso in snapshot_dates(db):
+        asset_vals, _ = values_on(db, iso)
+        invested_by_id = latest_invested(db, iso)
+        value = sum(v for aid, v in asset_vals.items() if aid in countable)
+        invested = sum(v for aid, v in invested_by_id.items()
+                       if aid in countable and aid in asset_vals)
+        out.append((iso, invested, value, value - invested))
+    return out
+
+
+def months_between(start, end) -> int:
+    """Whole months from ``start`` to ``end`` (0 if end is on/before start)."""
+    if start is None or end is None:
+        return 0
+    if isinstance(start, str):
+        start = date.fromisoformat(start[:10])
+    if isinstance(end, str):
+        end = date.fromisoformat(end[:10])
+    months = (end.year - start.year) * 12 + (end.month - start.month)
+    if end.day < start.day:
+        months -= 1                       # a partial month doesn't count as paid
+    return max(0, months)
+
+
+def monthly_interest(principal: float, annual_rate: Optional[float]) -> float:
+    """One month's interest on ``principal`` — the floor an EMI must clear."""
+    return (principal or 0.0) * (annual_rate or 0.0) / 100.0 / 12.0
+
+
+def required_emi(principal: float, annual_rate: Optional[float], months: int) -> Optional[float]:
+    """The EMI that clears ``principal`` in ``months`` — the standard EMI formula."""
+    if not principal or months <= 0:
+        return None
+    rate = (annual_rate or 0.0) / 100.0 / 12.0
+    if rate <= 0:
+        return round(principal / months, 2)
+    growth = (1.0 + rate) ** months
+    return round(principal * rate * growth / (growth - 1.0), 2)
+
+
+def emi_shortfall(principal: float, annual_rate: Optional[float],
+                  emi: float) -> Optional[float]:
+    """How far an EMI falls short of covering monthly interest (None if it's fine).
+
+    An EMI at or below one month's interest never reduces the balance — the debt
+    grows instead of amortizing, which is almost always a data-entry mistake.
+    """
+    if not principal or not emi or not annual_rate:
+        return None
+    interest = monthly_interest(principal, annual_rate)
+    return round(interest - emi, 2) if emi <= interest else None
+
+
+def estimate_outstanding(principal: float, annual_rate: Optional[float],
+                         emi: float, start_date, as_of) -> Optional[float]:
+    """Loan balance still owed on ``as_of``, by standard amortization.
+
+    ``balance = P(1+r)^n − EMI·((1+r)^n − 1)/r`` where *r* is the monthly rate and
+    *n* the number of EMIs paid. Returns None when there isn't enough information
+    (no principal, no EMI, or no start date), and never returns less than 0.
+
+    This is an *estimate* — real schedules move with rate changes, prepayments and
+    payment dates — so it's offered as a starting figure you can overwrite, not as
+    a substitute for the number on your statement.
+    """
+    if not principal or not emi or start_date is None:
+        return None
+    n = months_between(start_date, as_of)
+    if n <= 0:
+        return float(principal)
+    rate = (annual_rate or 0.0) / 100.0 / 12.0
+    if rate <= 0:
+        balance = principal - emi * n
+    else:
+        growth = (1.0 + rate) ** n
+        balance = principal * growth - emi * (growth - 1.0) / rate
+    return max(0.0, round(balance, 2))
+
+
+def estimate_outstanding_for(db: Database, liability_id: int, as_of) -> Optional[float]:
+    """``estimate_outstanding`` for a stored liability, or None if not computable."""
+    liab = next((l for l in list_liabilities(db) if l.id == liability_id), None)
+    if liab is None:
+        return None
+    return estimate_outstanding(liab.principal, liab.interest_rate, liab.emi_amount,
+                                liab.start_date, as_of)
+
+
+def record_estimated_outstanding(db: Database, liability_id: int,
+                                 as_of=None) -> Optional[float]:
+    """Work out a loan's balance on ``as_of`` and record it as a snapshot.
+
+    Saves a trip to the update screen when a loan's terms are enough to compute
+    its balance. Returns the value recorded, or None when it isn't computable
+    (no principal, EMI or start date).
+    """
+    as_of = as_of or date.today()
+    estimate = estimate_outstanding_for(db, liability_id, as_of)
+    if estimate is None:
+        return None
+    record_snapshot(db, as_of, liability_values={liability_id: estimate})
+    return estimate
 
 
 def monthly_obligations(db: Database) -> float:
@@ -425,24 +633,33 @@ def debt_to_asset(db: Database) -> Optional[float]:
     return point.liabilities / point.assets * 100.0
 
 
-def snapshot_matrix(db: Database) -> tuple[list[str], list[tuple[str, list[Optional[float]]]]]:
-    """(dates, rows) where each row is (holding name, value per date).
+#: Attribute columns shown alongside the dates in :func:`snapshot_matrix`.
+MATRIX_ATTRIBUTES = ["Kind", "Category", "Type", "Liquidity", "Owner", "Active"]
 
-    Reads like the spreadsheet: holdings down the side, snapshot dates across.
-    Liabilities appear as negative values so the grid sums to net worth.
+
+def snapshot_matrix(db: Database):
+    """(dates, rows) where each row is (name, [attributes], [value per date]).
+
+    Reads like the spreadsheet: holdings down the side with their attributes, then
+    one column per snapshot date. Liabilities appear as negative values so the grid
+    sums to net worth.
     """
     dates = snapshot_dates(db)
     con = db.connection
-    rows: list[tuple[str, list[Optional[float]]]] = []
+    rows: list[tuple[str, list[str], list[Optional[float]]]] = []
     for asset in list_assets(db):
         recorded = dict(con.execute(
             "SELECT as_of, value FROM asset_valuations WHERE asset_id=?", (asset.id,)).fetchall())
-        rows.append((asset.name, [recorded.get(d) for d in dates]))
+        attributes = ["Asset", asset.category, asset.asset_type, asset.liquidity,
+                      asset.owner, "yes" if asset.is_active else "retired"]
+        rows.append((asset.name, attributes, [recorded.get(d) for d in dates]))
     for liab in list_liabilities(db):
         recorded = dict(con.execute(
             "SELECT as_of, outstanding FROM liability_valuations WHERE liability_id=?",
             (liab.id,)).fetchall())
-        rows.append((f"{liab.name} (liability)",
+        attributes = ["Liability", liab.kind, "", "", liab.owner,
+                      "yes" if liab.is_active else "closed"]
+        rows.append((liab.name, attributes,
                      [(-recorded[d] if d in recorded else None) for d in dates]))
     return dates, rows
 

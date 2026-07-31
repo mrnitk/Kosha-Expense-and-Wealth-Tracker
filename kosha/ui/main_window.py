@@ -51,12 +51,19 @@ class MainWindow(QMainWindow):
         self._dashboard.changed.connect(self._view.refresh)
         self._dashboard.changed.connect(self._recurring.refresh)
         self._dashboard.changed.connect(self._update_status)
+        self._wealth.changed.connect(self._update_status)
+
+        # Two top-level sections, each with its own sub-tabs: what you spend, and
+        # what you own.
+        self._expense_tabs = QTabWidget()
+        self._expense_tabs.addTab(self._dashboard, "Dashboard")
+        self._expense_tabs.addTab(self._view, "Categorize")
+        self._expense_tabs.addTab(self._rules, "Rules")
+        self._expense_tabs.addTab(self._recurring, "Recurring")
+        self._expense_tabs.currentChanged.connect(self._on_expense_tab_changed)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._dashboard, "Dashboard")
-        self._tabs.addTab(self._view, "Categorize")
-        self._tabs.addTab(self._rules, "Rules")
-        self._tabs.addTab(self._recurring, "Recurring")
+        self._tabs.addTab(self._expense_tabs, "Expenses")
         self._tabs.addTab(self._wealth, "Net worth")
         self._tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self._tabs)
@@ -105,16 +112,27 @@ class MainWindow(QMainWindow):
     def _on_idle_timeout(self) -> None:
         """Idle limit reached — lock up and close."""
         QMessageBox.information(
-            self, "Locked",
-            f"Kosha locked itself after {self._auto_lock_minutes} minutes of inactivity.\n\n"
-            "Reopen it to unlock.")
+            self, "Kosha locked itself",
+            f"There was no activity for {self._auto_lock_minutes} minutes, so Kosha "
+            "locked the vault and will now close.\n\n"
+            "Your data stays saved and encrypted — nothing is lost. To carry on, "
+            "start Kosha again and enter your master password.\n\n"
+            "(Security ▸ Change master password lets you change it; the idle limit "
+            "is 5 minutes by default.)")
         self.close()          # closeEvent drops the key from memory
 
     def _on_tab_changed(self, _index: int) -> None:
-        # Refresh a tab's data when it's brought to the front.
+        """Top-level section changed (Expenses / Net worth)."""
         current = self._tabs.currentWidget()
         if current is self._wealth:
             self._wealth.refresh()
+        elif current is self._expense_tabs:
+            self._on_expense_tab_changed(self._expense_tabs.currentIndex())
+        self._update_status()          # the status line is per-section
+
+    def _on_expense_tab_changed(self, _index: int) -> None:
+        """Refresh an expense sub-tab's data when it's brought to the front."""
+        current = self._expense_tabs.currentWidget()
         if current is self._dashboard:
             self._dashboard.refresh_if_dirty()   # ~1s Plotly rebuild — only when shown
         elif current is self._recurring:
@@ -316,7 +334,10 @@ class MainWindow(QMainWindow):
         """Drop the key from memory and close — reopen to unlock."""
         if QMessageBox.question(
             self, "Lock Kosha",
-            "Lock the vault and close Kosha? Reopen it to unlock again.",
+            "Lock the vault now?\n\n"
+            "Kosha will close and the encryption key is dropped from memory. "
+            "Your data stays saved — nothing is lost.\n\n"
+            "To get back in, start Kosha again and enter your master password.",
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Yes:
             return
         self.close()          # closeEvent locks the database
@@ -389,39 +410,20 @@ class MainWindow(QMainWindow):
         box(self, "Import complete", result.summary())
 
     def _clear_data_dialog(self) -> None:
-        """Confirm and wipe data for a fresh start. Irreversible."""
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("Clear all data")
-        box.setText("This permanently deletes data from this vault and cannot be undone.")
-        box.setInformativeText(
-            "Delete transactions — removes all transactions and import history, but "
-            "keeps your categorization rules and accounts (a re-import re-applies them).\n\n"
-            "Full reset — also deletes all categorization rules and accounts."
-        )
-        txn_btn = box.addButton("Delete transactions", QMessageBox.DestructiveRole)
-        all_btn = box.addButton("Full reset", QMessageBox.DestructiveRole)
-        cancel_btn = box.addButton(QMessageBox.Cancel)
-        box.setDefaultButton(cancel_btn)
-        box.exec()
-
-        clicked = box.clickedButton()
-        if clicked is None or clicked is cancel_btn:
+        """Pick what to wipe — expenses, net worth, or everything. Irreversible."""
+        from .clear_data_dialog import ClearDataDialog, describe
+        dlg = ClearDataDialog(self._db, self)
+        dlg.exec()
+        if dlg.cleared is None:
             return
-        scope = "transactions" if clicked is txn_btn else "all"
-        try:
-            n = importer.clear_data(self._db, scope)
-        except Exception as exc:
-            QMessageBox.critical(self, "Clear failed", str(exc))
-            return
-
         self._view.refresh()
         self._rules.refresh()
         self._recurring.refresh()
+        self._wealth.refresh()
         self._dashboard.reset_filter_bounds()
         self._dashboard.refresh()
         self._update_status()
-        QMessageBox.information(self, "Data cleared", f"Removed {n} transaction(s).")
+        QMessageBox.information(self, "Data cleared", describe(dlg.cleared))
 
     # --- drag and drop -------------------------------------------------------
 
@@ -451,6 +453,20 @@ class MainWindow(QMainWindow):
     # --- status --------------------------------------------------------------
 
     def _update_status(self) -> None:
+        """Show a summary for whichever section is on screen."""
+        from .. import wealth
+        from ..format import format_inr
+        if getattr(self, "_tabs", None) is not None and \
+                self._tabs.currentWidget() is getattr(self, "_wealth", None):
+            assets = len(wealth.list_assets(self._db, active_only=True))
+            liabs = len(wealth.list_liabilities(self._db, active_only=True))
+            snapshots = len(wealth.snapshot_dates(self._db))
+            point = wealth.current_networth(self._db)
+            summary = (f"{assets} assets · {liabs} liabilities · {snapshots} snapshots")
+            if point.as_of:
+                summary += f" · net worth ₹{format_inr(point.net_worth)} as of {point.as_of}"
+            self.statusBar().showMessage(summary)
+            return
         n = self._db.connection.execute("SELECT count(*) FROM transactions").fetchone()[0]
         rules = self._db.connection.execute("SELECT count(*) FROM category_rules").fetchone()[0]
         supported = ", ".join(sorted(REGISTRY))

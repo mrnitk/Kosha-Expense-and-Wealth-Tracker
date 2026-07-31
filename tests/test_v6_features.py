@@ -96,6 +96,29 @@ def test_prettify_period(period, pretty):
     assert charts.prettify_period(period) == pretty
 
 
+def test_snapshot_labels_are_unique_per_date():
+    """Regression: two snapshots in one month collapsed to one label, and a bar
+    chart sums duplicate categories — silently doubling that month's bar."""
+    # Distinct months read cleanly, no day clutter.
+    assert charts.snapshot_labels(["2025-12-01", "2026-06-01", "2026-07-31"]) == \
+        ["Dec-2025", "Jun-2026", "Jul-2026"]
+    # Same month -> disambiguated by day, so every snapshot is its own bar.
+    labels = charts.snapshot_labels(["2026-06-01", "2026-07-15", "2026-07-31"])
+    assert labels == ["Jun-2026", "Jul-2026 (15)", "Jul-2026 (31)"]
+    assert len(labels) == len(set(labels))
+
+
+def test_networth_trend_does_not_merge_same_month_snapshots():
+    from kosha.wealth import NetWorthPoint
+    points = [
+        NetWorthPoint("2026-07-15", 4950000, 0, 4950000, None),
+        NetWorthPoint("2026-07-31", 4961368, 0, 4961368, 0.2),
+    ]
+    fig = charts.networth_trend(points)
+    xs = list(fig.data[0].x)                       # the Assets bar trace
+    assert len(xs) == len(set(xs))                 # no duplicate category to sum
+
+
 def test_income_line_uses_month_year_labels(db):
     rows = analytics.income_expense_savings(db, analytics.Filter(), "month")
     fig = charts.income_expense_line(rows)

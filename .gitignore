@@ -37,3 +37,6 @@ _wheeltest*/
 
 # Encrypted vault backups (never commit user data)
 kosha-backup-*.zip
+
+# Sample net-worth workbook generated for testing (contains real-ish figures)
+Kosha_networth_SAMPLE.xlsx

@@ -108,6 +108,42 @@ def test_import_is_idempotent_and_updates_in_place(tmp_path, db):
     assert wealth.current_networth(db).assets == 99000
 
 
+def test_import_invested_sheet_tracks_rising_cost_basis(tmp_path, db):
+    """A SIP's invested amount is dated, so gains are right for every snapshot."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = wt.ASSET_SHEET
+    ws.append(["Name", "Category", "Type", "Liquidity", "Owner", "Invested",
+               "Dec'23", "Jun'26"])
+    ws.append(["Mine (SIP)", "Mutual funds", "Equity", "Medium", "Me", 0, 568500, 789000])
+    iv = wb.create_sheet(wt.INVESTED_SHEET)
+    iv.append(["Name", "Category", "Type", "Liquidity", "Owner", "Invested",
+               "Dec'23", "Jun'26"])
+    iv.append(["Mine (SIP)", "Mutual funds", "Equity", "Medium", "Me", 0, 500000, 700000])
+    path = tmp_path / "nw.xlsx"
+    wb.save(str(path))
+
+    result = wt.import_wealth_template(db, path)
+    assert result.invested_recorded == 2
+    assert "invested-to-date" in result.summary()
+    series = wealth.gain_series(db)
+    assert [(d, inv, val, gain) for d, inv, val, gain in series] == [
+        ("2023-12-01", 500000, 568500, 68500),
+        ("2026-06-01", 700000, 789000, 89000),
+    ]
+
+
+def test_invested_sheet_is_optional(tmp_path, db):
+    path = _workbook(tmp_path / "nw.xlsx", [
+        ["Name", "Category", "Type", "Liquidity", "Owner", "Invested", "Jun'26"],
+        ["FD", "Bank", "Debt", "High", "Me", 500000, 540000],
+    ])
+    result = wt.import_wealth_template(db, path)     # no Invested sheet at all
+    assert result.invested_recorded == 0
+    rows = {n: (inv, cur, g) for n, inv, cur, g in wealth.invested_vs_current(db)}
+    assert rows["FD"] == (500000, 540000, 40000)     # static basis still works
+
+
 def test_import_liabilities_with_emi_and_outstanding(tmp_path, db):
     path = _workbook(
         tmp_path / "nw.xlsx",
@@ -191,16 +227,28 @@ def test_alias_headers_accepted(tmp_path, db):
 
 # --- template generation / round trip ----------------------------------------
 
-def test_write_blank_template_is_importable(tmp_path, db):
+def test_blank_template_shows_date_columns_and_a_hint(tmp_path, db):
+    """A blank template must make it obvious that date columns go on the right."""
     out = tmp_path / "blank.xlsx"
     wt.write_wealth_template(out)
     assert out.exists()
     import openpyxl
     wb = openpyxl.load_workbook(out)
     assert {wt.ASSET_SHEET, wt.LIABILITY_SHEET, wt.INSURANCE_SHEET} <= set(wb.sheetnames)
-    # The sample rows carry no date columns, so there's nothing to import yet.
-    with pytest.raises(wt.WealthTemplateError):
-        wt.import_wealth_template(db, out)
+
+    ws = wb[wt.ASSET_SHEET]
+    banner = [c.value or "" for c in ws[1]]
+    assert any("ONE COLUMN PER DATE" in str(v) for v in banner)     # visible hint
+    headers = [c.value for c in ws[2]]
+    assert headers[:len(wt.ASSET_HEADERS)] == wt.ASSET_HEADERS
+    example_dates = [h for h in headers[len(wt.ASSET_HEADERS):] if h]
+    assert example_dates, "blank template should seed example date columns"
+    assert all(wt.parse_period_header(str(h)) is not None for h in example_dates)
+
+    # The banner row is ignored on import (headers are found by content).
+    result = wt.import_wealth_template(db, out)
+    assert result.assets_created >= 1
+    assert result.values_recorded == 0        # example rows have no values filled in
 
 
 def test_export_round_trips_existing_data(tmp_path, db):

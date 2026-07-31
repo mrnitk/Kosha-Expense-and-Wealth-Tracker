@@ -70,6 +70,28 @@ def prettify_period(period: str) -> str:
     return s
 
 
+def snapshot_labels(isodates) -> list[str]:
+    """Distinct axis labels for snapshot dates, one per date.
+
+    Normally each snapshot is a different month, so a month label reads best. But
+    two snapshots can fall in the same month, and a bar chart SUMS traces that
+    share an x category — which would silently double that bar. So when a month
+    repeats, every date in it is disambiguated with its day (e.g. 'Jul-2026 (15)'
+    and 'Jul-2026 (31)'), keeping every snapshot its own bar.
+    """
+    months = [prettify_period(str(d)[:7]) for d in isodates]
+    counts: dict[str, int] = {}
+    for m in months:
+        counts[m] = counts.get(m, 0) + 1
+    labels = []
+    for iso, month in zip(isodates, months):
+        if counts[month] > 1:
+            labels.append(f"{month} ({str(iso)[8:10]})")   # add the day to break ties
+        else:
+            labels.append(month)
+    return labels
+
+
 def _frame(fig: go.Figure) -> go.Figure:
     """Draw a light border around the plotting area (axis lines, mirrored)."""
     line = "rgba(128,128,128,0.45)"
@@ -128,7 +150,7 @@ def networth_trend(points, template: str = "plotly_white") -> go.Figure:
     ``points`` are :class:`kosha.wealth.NetWorthPoint`. Growth % between snapshots
     is annotated on the net-worth line so progress is readable at a glance.
     """
-    labels = [prettify_period(p.as_of[:7]) for p in points]
+    labels = snapshot_labels([p.as_of for p in points])
     assets = [p.assets for p in points]
     liabs = [p.liabilities for p in points]
     net = [p.net_worth for p in points]
@@ -149,6 +171,36 @@ def networth_trend(points, template: str = "plotly_white") -> go.Figure:
     )
     fig.update_layout(**_layout(
         "Net worth over time", template, barmode="group",
+        xaxis=dict(categoryorder="array", categoryarray=labels),
+        yaxis=dict(title="Amount (₹)"),
+    ))
+    return _frame(fig)
+
+
+def gain_over_time(rows, template: str = "plotly_white") -> go.Figure:
+    """Contributions vs market value over time, with the gain between them.
+
+    ``rows`` are (date, invested, value, gain). Plotting both lines separates the
+    money you put in from the growth on top of it.
+    """
+    labels = snapshot_labels([r[0] for r in rows])
+    invested = [r[1] for r in rows]
+    value = [r[2] for r in rows]
+    gain = [r[3] for r in rows]
+
+    fig = go.Figure()
+    fig.add_bar(name="Gain", x=labels, y=gain, marker_color="#54A24B",
+                **_inr_hover(gain, "Gain"))
+    fig.add_scatter(name="Invested", x=labels, y=invested, mode="lines+markers",
+                    line=dict(color="#BAB0AC", width=2, dash="dot"),
+                    customdata=[format_inr(v) for v in invested],
+                    hovertemplate="%{x}<br>₹%{customdata}<extra>Invested</extra>")
+    fig.add_scatter(name="Current value", x=labels, y=value, mode="lines+markers",
+                    line=dict(color="#4C78A8", width=3),
+                    customdata=[format_inr(v) for v in value],
+                    hovertemplate="%{x}<br>₹%{customdata}<extra>Current value</extra>")
+    fig.update_layout(**_layout(
+        "Invested vs value over time", template,
         xaxis=dict(categoryorder="array", categoryarray=labels),
         yaxis=dict(title="Amount (₹)"),
     ))

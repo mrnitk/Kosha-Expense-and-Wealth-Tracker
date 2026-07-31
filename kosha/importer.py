@@ -223,34 +223,70 @@ class BulkResult:
         return "\n".join(lines)
 
 
-def clear_data(db: Database, scope: str = "transactions") -> int:
-    """Wipe imported data for a fresh start. Returns the transaction count removed.
+#: What each clear scope wipes, in the order the tables must be emptied.
+CLEAR_SCOPES = {
+    "transactions": ["transactions", "import_batches"],
+    "expenses": ["transactions", "import_batches", "category_rules",
+                 "keyword_aliases", "accounts"],
+    "networth_values": ["asset_valuations", "liability_valuations"],
+    "networth": ["asset_valuations", "liability_valuations", "assets",
+                 "liabilities", "insurance"],
+    "all": ["transactions", "import_batches", "category_rules", "keyword_aliases",
+            "accounts", "asset_valuations", "liability_valuations", "assets",
+            "liabilities", "insurance"],
+}
+
+#: Tables counted when reporting what a clear removed.
+_COUNT_TABLES = ("transactions", "category_rules", "accounts", "assets",
+                 "liabilities", "asset_valuations", "liability_valuations",
+                 "insurance")
+
+
+def data_counts(db: Database) -> dict[str, int]:
+    """Row counts per table, so the clear dialog can say what's at stake."""
+    con = db.connection
+    counts = {}
+    for table in _COUNT_TABLES:
+        try:
+            counts[table] = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        except Exception:
+            counts[table] = 0          # table not present in an older vault
+    return counts
+
+
+def clear_data(db: Database, scope: str = "transactions") -> dict[str, int]:
+    """Wipe data for a fresh start. Returns the row counts removed per table.
 
     ``scope``:
-        * ``"transactions"`` — delete transactions + import batches, but keep your
-          categorization rules and accounts, so a re-import re-applies them.
-        * ``"all"`` — full reset: also drop accounts and category rules.
+        * ``"transactions"`` — expense transactions + import batches, keeping your
+          categorization rules and accounts so a re-import re-applies them.
+        * ``"expenses"`` — all expense data: transactions, rules, keywords, accounts.
+        * ``"networth_values"`` — every dated snapshot, keeping the assets and
+          liabilities themselves so you can start the history again.
+        * ``"networth"`` — all net-worth data: holdings, snapshots and insurance.
+        * ``"all"`` — everything (expenses and net worth).
 
     Irreversible. Runs as one transaction, then reclaims file space with VACUUM.
     """
-    if scope not in ("transactions", "all"):
-        raise ValueError(f"unknown scope {scope!r}")
+    tables = CLEAR_SCOPES.get(scope)
+    if tables is None:
+        raise ValueError(f"unknown scope {scope!r} (expected one of "
+                         f"{', '.join(sorted(CLEAR_SCOPES))})")
     con = db.connection
-    n = con.execute("SELECT count(*) FROM transactions").fetchone()[0]
+    before = data_counts(db)
     try:
-        con.execute("DELETE FROM transactions")
-        con.execute("DELETE FROM import_batches")
-        if scope == "all":
-            con.execute("DELETE FROM category_rules")
-            con.execute("DELETE FROM accounts")
+        for table in tables:
+            con.execute(f"DELETE FROM {table}")
         con.commit()
     except Exception:
         con.rollback()
         raise
+    after = data_counts(db)
     # VACUUM can't run inside a transaction; sqlcipher3 auto-opens one, so commit
     # first (done above) then reclaim space outside it.
     con.execute("VACUUM")
-    return n
+    return {table: before[table] - after[table]
+            for table in before if before[table] - after[table] > 0}
 
 
 def import_paths(db: Database, paths) -> BulkResult:
