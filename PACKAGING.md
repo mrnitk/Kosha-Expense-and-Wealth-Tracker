@@ -1,5 +1,8 @@
 # Packaging Kosha for Windows
 
+> For the macOS build (`Kosha.app` in a `.dmg`) see
+> [PACKAGING-macos.md](PACKAGING-macos.md).
+
 Kosha ships as a **onedir** PyInstaller bundle wrapped in an Inno Setup
 installer. onedir (not onefile) is deliberate: QtWebEngine's `QtWebEngineProcess.exe`
 plus its resource tree are far more reliable unpacked than re-extracted to a temp
