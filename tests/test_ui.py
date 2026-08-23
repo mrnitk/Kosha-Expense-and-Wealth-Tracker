@@ -760,3 +760,117 @@ def test_unlock_dialog_backoff_after_repeated_failures(tmp_path, monkeypatch):
     assert dlg._tracker.seconds_remaining() > 0
     assert not dlg._buttons.button(QDialogButtonBox.Ok).isEnabled()
     assert "Try again in" in dlg._error.text()
+
+
+# --- auto-lock idle detection -------------------------------------------------
+#
+# The idle timer used to be driven by an application-wide event filter. That
+# routed every QObject's events through Python and segfaulted on macOS (PySide
+# re-enters the filter while building a wrapper for Cocoa's own objects), so
+# activity is now detected by filtering only Kosha's own windows.
+
+def _key_press():
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    return QKeyEvent(QEvent.KeyPress, Qt.Key_A, Qt.NoModifier, "a")
+
+
+def _watch_activity(win):
+    seen = []
+    win._idle_watcher.activity.connect(lambda: seen.append(1))
+    return seen
+
+
+def test_idle_watcher_is_not_an_application_wide_filter(tmp_path):
+    """Events for objects Kosha does not own must never reach the watcher."""
+    from PySide6.QtCore import QObject
+    from PySide6.QtWidgets import QApplication
+
+    db = _make_db(tmp_path)
+    win = MainWindow(db)
+    try:
+        seen = _watch_activity(win)
+        # A bare QObject stands in for the platform-owned objects (native menu
+        # bar, window animations) that crashed the old app-wide filter.
+        QApplication.sendEvent(QObject(), _key_press())
+        assert seen == []
+    finally:
+        win.close()
+
+
+def test_idle_watcher_sees_input_to_the_window(tmp_path):
+    """Real user input still restarts the auto-lock countdown."""
+    from PySide6.QtWidgets import QApplication
+
+    db = _make_db(tmp_path)
+    win = MainWindow(db)
+    try:
+        win.show()
+        handle = win.windowHandle()
+        assert handle is not None, "window never got a QWindow to watch"
+
+        seen = _watch_activity(win)
+        QApplication.sendEvent(handle, _key_press())
+        assert seen, "key press did not reset the idle timer"
+
+        # Re-watching must not double-count: Qt drops the earlier registration.
+        seen.clear()
+        win._idle_watcher.watch(handle)
+        QApplication.sendEvent(handle, _key_press())
+        assert len(seen) == 1
+    finally:
+        win.close()
+
+
+def test_idle_watcher_picks_up_dialogs(tmp_path):
+    """Typing in a dialog counts as activity, so a long edit can't trip the lock.
+
+    Kosha's dialogs are parented to whichever view opened them, not to the main
+    window, so the scan has to walk the whole widget tree.
+    """
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    db = _make_db(tmp_path)
+    win = MainWindow(db)
+    try:
+        win.show()
+        dlg = QDialog(win._wealth)      # as deep as a real asset/liability editor
+        dlg.show()
+        seen = _watch_activity(win)
+        win._idle_watcher._scan()       # normally the periodic scan does this
+        QApplication.sendEvent(dlg.windowHandle(), _key_press())
+        assert seen, "input to a dialog did not count as activity"
+    finally:
+        dlg.close()
+        win.close()
+
+
+def test_idle_watcher_ignores_other_windows(tmp_path):
+    """One window's input must not hold another window's vault open."""
+    from PySide6.QtWidgets import QApplication
+
+    dir_a, dir_b = tmp_path / "a", tmp_path / "b"
+    dir_a.mkdir(); dir_b.mkdir()
+    win_a, win_b = MainWindow(_make_db(dir_a)), MainWindow(_make_db(dir_b))
+    try:
+        win_a.show(); win_b.show()
+        seen_a = _watch_activity(win_a)
+        win_a._idle_watcher._scan()
+        QApplication.sendEvent(win_b.windowHandle(), _key_press())
+        assert seen_a == [], "a window watched one it does not own"
+    finally:
+        win_a.close(); win_b.close()
+
+
+def test_idle_watcher_stops_after_close(tmp_path):
+    """A closed window must not keep the vault alive by observing input."""
+    from PySide6.QtWidgets import QApplication
+
+    db = _make_db(tmp_path)
+    win = MainWindow(db)
+    win.show()
+    handle = win.windowHandle()
+    seen = _watch_activity(win)
+    win.close()
+    QApplication.sendEvent(handle, _key_press())
+    assert seen == []

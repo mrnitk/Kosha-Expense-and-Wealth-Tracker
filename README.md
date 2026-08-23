@@ -1,7 +1,7 @@
 # Kosha — Private, Secure & Offline Expense and Wealth Tracker
 
-Kosha is a **fully local, encrypted** personal finance tracker for Windows. It
-does two things, both entirely offline:
+Kosha is a **fully local, encrypted** personal finance tracker for **Windows and
+macOS**. It does two things, both entirely offline:
 
 - **Expenses** — import your bank and credit-card statements and Kosha turns them
   into a categorized, searchable picture of your spending.
@@ -84,14 +84,16 @@ Built for Indian bank statements (UPI / NEFT / IMPS / cards / SI mandates) and
 | UI | PySide6 (Qt Widgets), Plotly charts in a `QWebEngineView` |
 | Encryption / DB | SQLite + SQLCipher (AES‑256) via `sqlcipher3-wheels`; Argon2 key derivation (`argon2-cffi`) |
 | Statement parsing | `xlrd` (.xls), `openpyxl` (.xlsx), stdlib `csv` |
-| Packaging | PyInstaller (onedir) + Inno Setup installer (Windows) |
-| Data location | `%APPDATA%\Kosha\` (survives updates) |
+| Packaging | PyInstaller (onedir) + Inno Setup installer (Windows) / `.app` in a `.dmg` (macOS) |
+| Data location | `%APPDATA%\Kosha\` · `~/Library/Application Support/Kosha/` (survives updates) |
 
 ---
 
 ## Getting started (from source)
 
-Requires **Python 3.14** on Windows.
+Requires **Python 3.14**.
+
+**Windows**
 
 ```bash
 python -m venv .venv
@@ -100,9 +102,19 @@ pip install -r requirements.txt
 python -m kosha
 ```
 
+**macOS** (11+, Apple Silicon or Intel)
+
+```bash
+python3 -m venv .venv-mac
+source .venv-mac/bin/activate
+pip install -r requirements.txt
+python -m kosha
+```
+
 On first launch you set a **master password** — this creates the encrypted vault
-at `%APPDATA%\Kosha\`. There is no password recovery (that's the point), so keep
-it safe and use **File ▸ Backup vault** for a spare copy.
+at `%APPDATA%\Kosha\` on Windows, `~/Library/Application Support/Kosha/` on
+macOS. There is no password recovery (that's the point), so keep it safe and use
+**File ▸ Backup vault** for a spare copy.
 
 ### Importing your statements
 - **File ▸ Import statements…** — drop in HDFC `.xls` files (auto-detected).
@@ -111,15 +123,28 @@ it safe and use **File ▸ Backup vault** for a spare copy.
 
 ---
 
-## Build a Windows installer
+## Build an installer
 
-See [PACKAGING.md](PACKAGING.md). In short:
+**Windows** — see [PACKAGING.md](PACKAGING.md). In short:
 
 ```bash
 python -m PyInstaller --noconfirm --clean kosha.spec      # -> dist\Kosha\
 # then, with Inno Setup 6 installed:
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\kosha.iss
 ```
+
+**macOS** — see [PACKAGING-macos.md](PACKAGING-macos.md). One script builds the
+app, self-tests it, and packages the disk image:
+
+```bash
+./installer/macos/build_mac.sh
+# -> dist/mac/Kosha.app and installer/macos/Output/Kosha-<version>-<arch>.dmg
+```
+
+The `.dmg` is only ad-hoc signed, so the first launch of a *downloaded* copy
+needs right-click ▸ Open (or `xattr -dr com.apple.quarantine /Applications/Kosha.app`).
+Signing and notarizing properly is documented in
+[PACKAGING-macos.md](PACKAGING-macos.md).
 
 ---
 
@@ -143,8 +168,10 @@ Design notes:
 ## Privacy & data
 
 - **Nothing leaves your machine.** No telemetry, no accounts, no sync.
-- The encrypted database (`kosha.db`) and its salt live in `%APPDATA%\Kosha\` and
-  are **git-ignored** — real financial data is never part of this repository.
+- The encrypted database (`kosha.db`) and its salt live in `%APPDATA%\Kosha\`
+  (Windows) or `~/Library/Application Support/Kosha/` (macOS) and are
+  **git-ignored** — real financial data is never part of this repository.
+  Uninstalling never touches them; delete that folder by hand to erase your data.
 - The only sample data in the repo is **fabricated** test fixtures
   (`tests/fixtures/`), used to test the parsers.
 

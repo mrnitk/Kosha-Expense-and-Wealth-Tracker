@@ -38,9 +38,26 @@ def _selftest() -> int:
     html = pio.to_html(go.Figure(go.Bar(x=[1], y=[2])), include_plotlyjs="inline", full_html=True)
     assert "plotly" in html.lower() and len(html) > 100_000, "plotly.js not bundled"
 
-    # 3) QtWebEngine (the dashboard's renderer).
+    # 3) QtWebEngine (the dashboard's renderer). Constructing the view isn't
+    #    enough — actually load the page, which is what forces the separate
+    #    QtWebEngineProcess helper to spawn. That helper lives outside the main
+    #    executable (a nested .app on macOS, a .exe on Windows) and is the part
+    #    most likely to be missing or unlaunchable in a frozen bundle.
+    from PySide6.QtCore import QEventLoop, QTimer, QUrl
     from PySide6.QtWebEngineWidgets import QWebEngineView
-    QWebEngineView()
+    chart_file = os.path.join(workdir, "chart.html")
+    with open(chart_file, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    view = QWebEngineView()
+    loop, loaded = QEventLoop(), []
+    view.loadFinished.connect(lambda ok: (loaded.append(ok), loop.quit()))
+    # setUrl, not setHtml: setHtml data-URL-encodes the page and caps it at ~2 MB,
+    # which an inlined-Plotly chart blows past. The dashboard loads from a file
+    # for the same reason, so this exercises the real path.
+    view.setUrl(QUrl.fromLocalFile(chart_file))
+    QTimer.singleShot(60_000, loop.quit)   # don't hang a build forever
+    loop.exec()
+    assert loaded and loaded[0], "QtWebEngine did not render (helper process missing?)"
 
     # 4) openpyxl (.xlsx) for the template importer — round-trip a blank template.
     from kosha import template_import

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QTimer
+from PySide6.QtCore import QEvent, QObject, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QMainWindow, QMessageBox, QTabWidget,
+    QFileDialog, QMainWindow, QMessageBox, QTabWidget, QWidget,
 )
 
 from .. import format as fmt
@@ -22,6 +23,89 @@ from .rules_view import RulesView
 from .wealth_view import WealthView
 
 _IMPORT_FILTER = "Statements (*.xls *.xlsx *.csv *.pdf);;All files (*)"
+# Ctrl+H maps to ⌘H on macOS, which the system reserves for "Hide application" —
+# the privacy mask takes ⌘⇧H there instead.
+_MASK_SHORTCUT = QKeySequence("Ctrl+Shift+H" if sys.platform == "darwin" else "Ctrl+H")
+
+
+class _IdleWatcher(QObject):
+    """Reports user input to the auto-lock timer by watching Kosha's own windows.
+
+    An application-wide event filter would be one line, but it routes *every*
+    QObject's events through Python, and PySide has to build a wrapper for each
+    object it has not seen before. Building that wrapper sets a dynamic property
+    on the object, which posts a property-change event, which re-enters this
+    filter while the wrapper is still half-built — and the second pass segfaults
+    reading a null metaObject. On Windows it never comes up; on macOS Cocoa hands
+    Qt objects the app never created (the native menu bar, window animations) and
+    it crashes within seconds of the window appearing.
+
+    Watching top-level QWindows avoids all of that: the platform delivers key and
+    mouse input to the window before it reaches any widget, so this still sees
+    every real interaction, and the only objects filtered are ones Qt handed us
+    directly. Dialogs get their own window too, and are found by _scan below.
+    """
+
+    #: Emitted on any user input to a watched window. A signal rather than a
+    #: callback on purpose: holding a bound method of the parent window would
+    #: make a MainWindow -> watcher -> MainWindow reference cycle, and collecting
+    #: that cycle tears the window's own signal connections down out of order.
+    activity = Signal()
+
+    _ACTIVITY = (
+        QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.KeyPress, QEvent.Wheel,
+    )
+
+    #: How often to look for windows opened since the last check. Polling beats
+    #: connecting to the application's focusWindowChanged signal: the
+    #: QApplication outlives every window, so such a connection is left pointing
+    #: at a dead watcher whenever a window goes away without closing cleanly.
+    #: A few seconds of lag cannot matter to a timer measured in minutes.
+    _SCAN_MS = 2000
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._enabled = True
+        self._scan()
+        self._scan_timer = QTimer(self)      # dies with this watcher
+        self._scan_timer.timeout.connect(self._scan)
+        self._scan_timer.start(self._SCAN_MS)
+
+    def _scan(self) -> None:
+        """Watch this window and any dialog currently open beneath it.
+
+        Deliberately walks the owning window's own widget tree rather than
+        QApplication.topLevelWindows(): the application's list also holds windows
+        belonging to anything else alive in the process, and watching those would
+        let one window's input reset an unrelated window's lock countdown.
+        Dialogs are parented to whichever view opened them, so the walk recurses.
+        """
+        owner = self.parent()
+        if owner is None:
+            return
+        self.watch(owner.windowHandle())
+        for child in owner.findChildren(QWidget):
+            if child.isWindow():
+                self.watch(child.windowHandle())
+
+    def watch(self, window) -> None:
+        """Start filtering a top-level window (no-op for None, safe to repeat).
+
+        Qt drops any earlier registration of the same filter before re-adding it,
+        so re-watching a window Kosha already watches cannot double-count.
+        """
+        if window is not None:
+            window.installEventFilter(self)
+
+    def stop(self) -> None:
+        """Stop observing — the window is going away."""
+        self._enabled = False
+        self._scan_timer.stop()
+
+    def eventFilter(self, obj, event):    # noqa: N802 (Qt signature)
+        if self._enabled and event.type() in self._ACTIVITY:
+            self.activity.emit()
+        return False        # never consume: this only observes
 _IMPORT_SUFFIXES = {".xls", ".xlsx", ".csv", ".pdf"}
 
 
@@ -75,15 +159,19 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         theme.force_light_titlebar(self)   # keep the title bar light under OS dark mode
+        # windowHandle() only exists once the window is created, so this is the
+        # first point the main window can be watched for activity.
+        watcher = getattr(self, "_idle_watcher", None)
+        if watcher is not None:
+            watcher.watch(self.windowHandle())
 
     # --- auto-lock -----------------------------------------------------------
 
     def _setup_auto_lock(self) -> None:
         """Lock the vault after a period of no interaction.
 
-        The timer is reset by any key/mouse activity in the window (installed as
-        an application-wide event filter), so it only fires when the app has
-        genuinely been left alone.
+        The timer is reset by any key/mouse activity in Kosha's windows (see
+        _IdleWatcher), so it only fires when the app has genuinely been left alone.
         """
         from .. import wealth
         minutes = _int_or(wealth.get_setting(self._db, "auto_lock_minutes", "5"), 5)
@@ -91,9 +179,8 @@ class MainWindow(QMainWindow):
         self._idle_timer = QTimer(self)
         self._idle_timer.setSingleShot(True)
         self._idle_timer.timeout.connect(self._on_idle_timeout)
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+        self._idle_watcher = _IdleWatcher(self)
+        self._idle_watcher.activity.connect(self._restart_idle_timer)
         self._restart_idle_timer()
 
     def _restart_idle_timer(self) -> None:
@@ -101,13 +188,6 @@ class MainWindow(QMainWindow):
             self._idle_timer.start(self._auto_lock_minutes * 60 * 1000)
         else:
             self._idle_timer.stop()
-
-    def eventFilter(self, obj, event):    # noqa: N802 (Qt signature)
-        if event.type() in (
-            QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.KeyPress, QEvent.Wheel
-        ):
-            self._restart_idle_timer()
-        return super().eventFilter(obj, event)
 
     def _on_idle_timeout(self) -> None:
         """Idle limit reached — lock up and close."""
@@ -187,7 +267,7 @@ class MainWindow(QMainWindow):
         # --- View: privacy mask ---
         view_menu = self.menuBar().addMenu("&View")
         self._mask_action = QAction("&Hide amounts", self, checkable=True)
-        self._mask_action.setShortcut(QKeySequence("Ctrl+H"))
+        self._mask_action.setShortcut(_MASK_SHORTCUT)
         self._mask_action.setToolTip("Mask every amount on screen (shoulder-surfing protection)")
         self._mask_action.toggled.connect(self._on_toggle_mask)
         view_menu.addAction(self._mask_action)
@@ -307,8 +387,9 @@ class MainWindow(QMainWindow):
         """Mask or reveal every amount in the app (one central switch)."""
         fmt.set_masked(on)
         self._refresh_all_views()
+        key = _MASK_SHORTCUT.toString(QKeySequence.NativeText)
         self.statusBar().showMessage(
-            "Amounts hidden — press Ctrl+H to reveal" if on else "Amounts visible", 4000)
+            f"Amounts hidden — press {key} to reveal" if on else "Amounts visible", 4000)
 
     def _refresh_all_views(self) -> None:
         """Re-render every view (used after a mask toggle)."""
@@ -474,12 +555,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         # Stop watching for activity before going away, so a closed window never
-        # keeps filtering application events.
+        # keeps resetting the idle timer.
         if getattr(self, "_idle_timer", None) is not None:
             self._idle_timer.stop()
-        app = QApplication.instance()
-        if app is not None:
-            app.removeEventFilter(self)
+        if getattr(self, "_idle_watcher", None) is not None:
+            self._idle_watcher.stop()
         self._db.lock()          # drop the encryption key from memory
         super().closeEvent(event)
 
